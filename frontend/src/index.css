@@ -1,0 +1,159 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  
+  --color-primary: #003358;
+  --color-primary-container: #004a7c;
+  --color-primary-fixed: #d0e4ff;
+  --color-on-primary-fixed-variant: #00497b;
+  --color-on-primary: #ffffff;
+  
+  --color-secondary: #4c6172;
+  --color-secondary-container: #cfe5fa;
+  --color-secondary-fixed: #cfe5fa;
+  --color-on-secondary-fixed-variant: #344959;
+  --color-on-secondary-container: #526778;
+  
+  --color-tertiary: #00382d;
+  --color-tertiary-container: #005142;
+  --color-tertiary-fixed: #96f4d9;
+  --color-tertiary-fixed-dim: #7ad8bd;
+  --color-on-tertiary-fixed-variant: #005141;
+  
+  --color-error: #ba1a1a;
+  --color-error-container: #ffdad6;
+  --color-on-error-container: #93000a;
+  
+  --color-surface: #f6faff;
+  --color-surface-container-lowest: #ffffff;
+  --color-surface-container-low: #eff4fb;
+  --color-surface-container: #e9eef5;
+  --color-surface-container-high: #e3e9f0;
+  --color-surface-container-highest: #dde3ea;
+  --color-surface-tint: #296195;
+  
+  --color-on-surface: #161c21;
+  --color-on-surface-variant: #42474f;
+  
+  --color-outline: #727780;
+  --color-outline-variant: #c1c7d0;
+}
+
+@layer base {
+  body {
+    @apply bg-surface text-on-surface font-sans antialiased selection:bg-primary-fixed selection:text-on-primary-fixed-variant;
+  }
+}
+
+@layer utilities {
+  .glass-effect {
+    @apply bg-surface/80 backdrop-blur-md;
+  }
+  
+  .pulse-dot {
+    box-shadow: 0 0 0 0 rgba(0, 56, 45, 0.4);
+    animation: pulse 2s infinite;
+  }
+  
+  @keyframes pulse {
+    0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 56, 45, 0.7); }
+    70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(0, 56, 45, 0); }
+    100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(0, 56, 45, 0); }
+  }
+
+  /* Modal animations */
+  .animate-modal-in {
+    animation: modalSlideIn 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  @keyframes modalSlideIn {
+    from { opacity: 0; transform: translateY(20px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+
+  .animate-overlay-in {
+    animation: overlayFadeIn 0.25s ease-out both;
+  }
+
+  @keyframes overlayFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Card hover lift */
+  .card-hover-lift {
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+  }
+  .card-hover-lift:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 24px rgba(0, 51, 88, 0.08);
+  }
+
+  /* Fade in up stagger */
+  .animate-fade-in-up {
+    animation: fadeInUp 0.4s ease-out both;
+  }
+
+  @keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Status glow */
+  .status-glow-green {
+    box-shadow: 0 0 8px rgba(0, 56, 45, 0.3);
+  }
+  .status-glow-red {
+    box-shadow: 0 0 8px rgba(186, 26, 26, 0.3);
+  }
+  .status-glow-amber {
+    box-shadow: 0 0 8px rgba(200, 140, 0, 0.3);
+  }
+
+  /* Custom scrollbar */
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 5px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: rgba(0, 51, 88, 0.15);
+    border-radius: 10px;
+  }
+  .custom-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: rgba(0, 51, 88, 0.3);
+  }
+
+  /* Gradient text */
+  .text-gradient-primary {
+    background: linear-gradient(135deg, #003358, #004a7c);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+
+  /* File upload drop zone */
+  .file-drop-zone {
+    border: 2px dashed rgba(0, 51, 88, 0.2);
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .file-drop-zone:hover, .file-drop-zone.dragging {
+    border-color: rgba(0, 51, 88, 0.5);
+    background: rgba(0, 51, 88, 0.03);
+  }
+
+  /* Smooth shimmer for loading */
+  .shimmer {
+    background: linear-gradient(90deg, #e3e9f0 25%, #eff4fb 50%, #e3e9f0 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.5s infinite;
+  }
+
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+}
