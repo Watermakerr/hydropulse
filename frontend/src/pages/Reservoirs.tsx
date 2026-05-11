@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { MapContainer, Marker as LeafletMarker, Polygon, Popup, TileLayer, useMap, useMapEvents } from 'react-leaflet';
+import { MapContainer, Marker as LeafletMarker, Polygon, Popup, TileLayer, useMap, useMapEvents, ImageOverlay } from 'react-leaflet';
 import 'leaflet/dist/leaflet.css';
 import {
   FileText, MapPin, Plus, ShieldCheck, Trash2, Pencil, Search, Waves, Flag, AlertTriangle,
@@ -246,6 +246,16 @@ export default function Reservoirs() {
   const sentinelEnabled = Boolean(SENTINEL2_TILE_URL);
   const tileUrl = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_TILE_URL : ESRI_TILE_URL;
   const tileAttribution = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_ATTRIBUTION : ESRI_ATTRIBUTION;
+
+  const currentBounds = useMemo(() => {
+    if (!currentBoundary || currentBoundary.length === 0) return null;
+    const lats = currentBoundary.map(p => p[0]);
+    const lngs = currentBoundary.map(p => p[1]);
+    return [
+      [Math.min(...lats), Math.min(...lngs)],
+      [Math.max(...lats), Math.max(...lngs)]
+    ] as [number, number][];
+  }, [currentBoundary]);
 
   const filteredReservoirs = useMemo(() => {
     return reservoirs.filter((r) => {
@@ -687,20 +697,18 @@ export default function Reservoirs() {
           <p className="text-[10px] text-on-surface-variant font-bold uppercase tracking-wider">Nhiệm vụ</p>
           <p className="text-2xl font-black text-primary mt-0.5 tracking-tight">{activeTasks}<span className="text-sm font-medium text-on-surface-variant">/{reservoirTasks.length}</span></p>
         </div>
-        <div className={`p-5 rounded-xl shadow-[0_4px_16px_rgba(0,51,88,0.04)] card-hover-lift ${
-          latestAlert === 'HIGH' ? 'bg-red-50 border border-red-100' :
-          latestAlert === 'MEDIUM' ? 'bg-amber-50 border border-amber-100' :
-          'bg-surface-container-lowest'
-        }`}>
+        <div className={`p-5 rounded-xl shadow-[0_4px_16px_rgba(0,51,88,0.04)] card-hover-lift ${latestAlert === 'HIGH' ? 'bg-red-50 border border-red-100' :
+            latestAlert === 'MEDIUM' ? 'bg-amber-50 border border-amber-100' :
+              'bg-surface-container-lowest'
+          }`}>
           <div className="flex items-center justify-between mb-3">
             <div className={`p-2 rounded-lg ${latestAlert === 'HIGH' ? 'bg-red-100' : latestAlert === 'MEDIUM' ? 'bg-amber-100' : 'bg-slate-100'}`}>
               <Satellite className={`w-4 h-4 ${latestAlert === 'HIGH' ? 'text-red-600' : latestAlert === 'MEDIUM' ? 'text-amber-600' : 'text-slate-500'}`} />
             </div>
           </div>
           <p className="text-[10px] text-on-surface-variant font-bold uppercase tracking-wider">Cảnh báo vệ tinh</p>
-          <p className={`text-2xl font-black mt-0.5 tracking-tight ${
-            latestAlert === 'HIGH' ? 'text-red-700' : latestAlert === 'MEDIUM' ? 'text-amber-700' : 'text-primary'
-          }`}>{latestAlert || '—'}</p>
+          <p className={`text-2xl font-black mt-0.5 tracking-tight ${latestAlert === 'HIGH' ? 'text-red-700' : latestAlert === 'MEDIUM' ? 'text-amber-700' : 'text-primary'
+            }`}>{latestAlert || '—'}</p>
         </div>
       </div>
 
@@ -740,11 +748,10 @@ export default function Reservoirs() {
                   <button
                     key={f}
                     onClick={() => setSidebarFilter(f)}
-                    className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition-all ${
-                      sidebarFilter === f
+                    className={`text-[10px] font-bold px-2.5 py-1 rounded-full transition-all ${sidebarFilter === f
                         ? 'bg-primary text-white'
                         : 'bg-surface-container text-on-surface-variant hover:bg-surface-container-high'
-                    }`}
+                      }`}
                   >
                     {f === 'all' ? 'Tất cả' : reservoirStatusLabels[f]}
                   </button>
@@ -760,20 +767,18 @@ export default function Reservoirs() {
                 return (
                   <div
                     key={reservoir.id}
-                    className={`p-3.5 rounded-xl cursor-pointer transition-all group ${
-                      isActive
+                    className={`p-3.5 rounded-xl cursor-pointer transition-all group ${isActive
                         ? 'bg-primary/[0.06] border border-primary/20 shadow-[0_2px_8px_rgba(0,51,88,0.06)]'
                         : 'hover:bg-surface-container-low border border-transparent'
-                    }`}
+                      }`}
                     onClick={() => setActiveReservoir(reservoir.id)}
                   >
                     <div className="flex justify-between items-start gap-2 mb-1.5">
                       <h3 className={`font-bold text-sm leading-tight ${isActive ? 'text-primary' : 'text-on-surface'}`}>
                         {reservoir.name}
                       </h3>
-                      <ChevronRight className={`w-4 h-4 shrink-0 transition-transform ${
-                        isActive ? 'text-primary rotate-0' : 'text-on-surface-variant/40 group-hover:translate-x-0.5'
-                      }`} />
+                      <ChevronRight className={`w-4 h-4 shrink-0 transition-transform ${isActive ? 'text-primary rotate-0' : 'text-on-surface-variant/40 group-hover:translate-x-0.5'
+                        }`} />
                     </div>
                     <p className="text-[11px] text-on-surface-variant mb-2 line-clamp-2">{reservoir.description}</p>
                     <div className="flex items-center gap-2 flex-wrap">
@@ -838,6 +843,14 @@ export default function Reservoirs() {
                 attribution={tileAttribution}
                 url={tileUrl}
               />
+              {selectedSceneId && currentBounds && (
+                <ImageOverlay
+                  url={`http://localhost:4000/api/satellite/thumbnail/${selectedSceneId}?width=1024`}
+                  bounds={currentBounds}
+                  opacity={0.8}
+                  zIndex={10}
+                />
+              )}
               {currentBoundary.length > 0 && <Polygon positions={currentBoundary} pathOptions={{ color: '#003358', fillColor: '#004a7c', fillOpacity: 0.2 }} />}
               {markers.map((marker) => (
                 <LeafletMarker
@@ -878,9 +891,8 @@ export default function Reservoirs() {
                 Vệ tinh
               </button>
               <button
-                className={`px-3 py-1.5 rounded-lg transition-all ${baseLayer === 'sentinel2' ? 'bg-primary text-white shadow-sm' : 'hover:bg-slate-100 text-on-surface-variant'} ${
-                  !sentinelEnabled ? 'opacity-40 cursor-not-allowed' : ''
-                }`}
+                className={`px-3 py-1.5 rounded-lg transition-all ${baseLayer === 'sentinel2' ? 'bg-primary text-white shadow-sm' : 'hover:bg-slate-100 text-on-surface-variant'} ${!sentinelEnabled ? 'opacity-40 cursor-not-allowed' : ''
+                  }`}
                 onClick={() => {
                   if (sentinelEnabled) {
                     setBaseLayer('sentinel2');
@@ -928,11 +940,10 @@ export default function Reservoirs() {
                       setQuickMarkerMode((prev) => !prev);
                     }}
                     disabled={working || !activeReservoir}
-                    className={`flex items-center gap-1.5 font-bold text-xs px-3 py-2 rounded-lg transition-all ${
-                      quickMarkerMode
+                    className={`flex items-center gap-1.5 font-bold text-xs px-3 py-2 rounded-lg transition-all ${quickMarkerMode
                         ? 'bg-primary text-white'
                         : 'text-primary hover:bg-primary-fixed/40 border border-primary/10'
-                    }`}
+                      }`}
                   >
                     <Crosshair className="w-3.5 h-3.5" />
                     {quickMarkerMode ? 'Tắt' : 'Thêm nhanh'}
@@ -1093,9 +1104,8 @@ export default function Reservoirs() {
                     return (
                       <button
                         key={task.id}
-                        className={`w-full text-left px-5 py-3.5 border-b border-slate-50 transition-all border-l-[3px] ${priorityBorder} ${
-                          isSelected ? 'bg-primary-fixed/30' : 'hover:bg-surface-container/50'
-                        }`}
+                        className={`w-full text-left px-5 py-3.5 border-b border-slate-50 transition-all border-l-[3px] ${priorityBorder} ${isSelected ? 'bg-primary-fixed/30' : 'hover:bg-surface-container/50'
+                          }`}
                         onClick={() => setSelectedTaskId(task.id)}
                       >
                         <div className="flex items-start gap-2">
@@ -1320,11 +1330,10 @@ export default function Reservoirs() {
                       </div>
                       <div className="flex justify-between items-center mt-auto border-t border-slate-50 pt-2.5">
                         <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-tight">Cảnh báo</span>
-                        <span className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded-full ${
-                          record.alert_level === 'HIGH' ? 'bg-red-50 text-red-700' :
-                          record.alert_level === 'MEDIUM' ? 'bg-amber-50 text-amber-700' :
-                          'bg-emerald-50 text-emerald-700'
-                        }`}>
+                        <span className={`text-[10px] font-black uppercase px-2.5 py-0.5 rounded-full ${record.alert_level === 'HIGH' ? 'bg-red-50 text-red-700' :
+                            record.alert_level === 'MEDIUM' ? 'bg-amber-50 text-amber-700' :
+                              'bg-emerald-50 text-emerald-700'
+                          }`}>
                           {record.alert_level === 'HIGH' ? 'Cao' : record.alert_level === 'MEDIUM' ? 'Trung bình' : 'Thấp'}
                         </span>
                       </div>
@@ -1387,11 +1396,10 @@ export default function Reservoirs() {
                         key={s}
                         type="button"
                         onClick={() => setReservoirForm({ ...reservoirForm, status: s })}
-                        className={`flex-1 text-xs font-bold px-4 py-2.5 rounded-xl border-2 transition-all flex items-center justify-center gap-2 ${
-                          reservoirForm.status === s
+                        className={`flex-1 text-xs font-bold px-4 py-2.5 rounded-xl border-2 transition-all flex items-center justify-center gap-2 ${reservoirForm.status === s
                             ? 'border-primary bg-primary/5 text-primary'
                             : 'border-slate-200 hover:border-slate-300 text-on-surface-variant'
-                        }`}
+                          }`}
                       >
                         <span className={`w-2 h-2 rounded-full ${sc.dot}`}></span>
                         {reservoirStatusLabels[s]}
@@ -1534,11 +1542,10 @@ export default function Reservoirs() {
                         key={s}
                         type="button"
                         onClick={() => setMarkerForm({ ...markerForm, status: s })}
-                        className={`text-[11px] font-bold px-3 py-2.5 rounded-xl border-2 transition-all flex items-center gap-2 ${
-                          markerForm.status === s
+                        className={`text-[11px] font-bold px-3 py-2.5 rounded-xl border-2 transition-all flex items-center gap-2 ${markerForm.status === s
                             ? 'border-primary bg-primary/5 text-primary'
                             : 'border-slate-200 hover:border-slate-300 text-on-surface-variant'
-                        }`}
+                          }`}
                       >
                         <span className={`w-2 h-2 rounded-full ${mc.dot}`}></span>
                         {markerStatusVi[s]}
@@ -1572,25 +1579,28 @@ export default function Reservoirs() {
                 style={{ height: '100%', width: '100%', background: '#000' }}
                 zoomControl={true}
               >
+                {/* Standard background map */}
                 <TileLayer
-                  url={`http://localhost:4000/api/satellite/tiles/${selectedSceneId}/{z}/{x}/{y}`}
-                  maxNativeZoom={15}
-                  maxZoom={18}
+                  url={ESRI_TILE_URL}
+                  attribution={ESRI_ATTRIBUTION}
                 />
+                
+                {/* High-res satellite thumbnail overlay */}
+                {selectedSceneId && currentBounds && (
+                  <ImageOverlay
+                    url={`http://localhost:4000/api/satellite/thumbnail/${selectedSceneId}?width=1536`}
+                    bounds={currentBounds}
+                    opacity={1}
+                    zIndex={5}
+                  />
+                )}
+
+                {/* Reservoir boundary on top */}
                 {currentBoundary.length > 0 && (
-                  <>
-                    <Polygon
-                      positions={[
-                        [ [-90, -180], [90, -180], [90, 180], [-90, 180], [-90, -180] ],
-                        currentBoundary as any
-                      ]}
-                      pathOptions={{ color: 'transparent', fillColor: '#000000', fillOpacity: 0.95 }}
-                    />
-                    <Polygon
-                      positions={currentBoundary}
-                      pathOptions={{ color: '#0ea5e9', weight: 2, fillOpacity: 0 }}
-                    />
-                  </>
+                  <Polygon
+                    positions={currentBoundary}
+                    pathOptions={{ color: '#0ea5e9', weight: 3, fillOpacity: 0 }}
+                  />
                 )}
               </MapContainer>
             </div>
