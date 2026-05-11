@@ -139,29 +139,118 @@ router.get(
  *     security:
  *       - bearerAuth: []
  */
+// Accept both JSON and multipart/form-data (mobile client sends multipart with photos)
 router.post(
   '/',
   requireAuth,
+  upload.array('photos', 10),
   [
-    body('taskId').isUUID(),
+    body('taskId').optional().isUUID(),
     body('description').optional().isString(),
     body('conditionStatus').optional().isIn(['good', 'minor_damage', 'major_damage', 'destroyed'])
   ],
   validate,
   asyncHandler(async (req, res) => {
-    const { taskId, description, conditionStatus = 'good', locationGeoJSON } = req.body;
+    // If multipart: fields come from req.body, files are in req.files
+    // Mobile client sends: taskId, inspectorId, notes, coordinates ("lng,lat") and photos[]
+    const isMultipart = req.files && req.files.length > 0;
 
-    const result = await pool.query(
-      `INSERT INTO task_reports (task_id, worker_id, description, condition_status, location, sync_status)
-       VALUES ($1, $2, $3, $4,
-               CASE WHEN $5::text IS NULL THEN NULL ELSE ST_SetSRID(ST_GeomFromGeoJSON($5),4326) END,
-               'pending')
-       RETURNING id, task_id, worker_id, description, condition_status, sync_status, reported_at,
-                 CASE WHEN location IS NULL THEN NULL ELSE ST_AsGeoJSON(location)::json END AS location_geojson`,
-      [taskId, req.user.sub, description || null, conditionStatus, locationGeoJSON ? JSON.stringify(locationGeoJSON) : null]
-    );
+    let taskId = req.body.taskId;
+    let description = req.body.description || req.body.notes || null;
+    let conditionStatus = req.body.conditionStatus || 'good';
+    let locationGeoJSON = null;
 
-    return res.status(201).json({ success: true, data: result.rows[0] });
+    if (isMultipart && req.body.coordinates) {
+      const coords = req.body.coordinates.split(',').map(Number);
+      if (coords.length === 2 && !coords.some(isNaN)) {
+        locationGeoJSON = { type: 'Point', coordinates: coords };
+      }
+    } else if (req.body.locationGeoJSON) {
+      locationGeoJSON = typeof req.body.locationGeoJSON === 'string' ? JSON.parse(req.body.locationGeoJSON) : req.body.locationGeoJSON;
+    }
+
+    const client = await pool.connect();
+    let reportRow;
+
+    try {
+      await client.query('BEGIN');
+
+      const insertRes = await client.query(
+        `INSERT INTO task_reports (task_id, worker_id, description, condition_status, location, sync_status)
+         VALUES ($1, $2, $3, $4,
+                 CASE WHEN $5::text IS NULL THEN NULL ELSE ST_SetSRID(ST_GeomFromGeoJSON($5),4326) END,
+                 'pending')
+         RETURNING id, task_id, worker_id, description, condition_status, sync_status, reported_at,
+                   CASE WHEN location IS NULL THEN NULL ELSE ST_AsGeoJSON(location)::json END AS location_geojson`,
+        [taskId, req.user.sub, description || null, conditionStatus, locationGeoJSON ? JSON.stringify(locationGeoJSON) : null]
+      );
+
+      reportRow = insertRes.rows[0];
+
+      // If photos were uploaded, store them using blobStorage and create report_photos rows
+      if (isMultipart && req.files.length) {
+        for (const file of req.files) {
+          const blobName = `reports/${reportRow.id}/${Date.now()}-${file.originalname}`;
+          let uploaded = null;
+          let uploadStatus = 'uploaded';
+          let uploadError = null;
+          let readUrl = '';
+          try {
+            uploaded = await uploadBuffer(file.buffer, blobName, file.mimetype);
+            // Generate SAS URL for immediate access
+            if (uploaded && uploaded.blobPath) {
+              readUrl = await getReadUrl(uploaded.blobPath);
+            }
+          } catch (err) {
+            uploadStatus = 'failed';
+            uploadError = err.message;
+          }
+
+          await client.query(
+            `INSERT INTO report_photos (report_id, url, caption, blob_path, upload_status, upload_error, metadata)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              reportRow.id,
+              readUrl,
+              null,
+              uploaded ? uploaded.blobPath : blobName,
+              uploadStatus,
+              uploadError,
+              JSON.stringify({ originalName: file.originalname, mimeType: file.mimetype, size: file.size })
+            ]
+          );
+        }
+
+        // Mark synced
+        await client.query(
+          `UPDATE task_reports SET sync_status = 'synced', synced_at = NOW(), sync_error = NULL WHERE id = $1`,
+          [reportRow.id]
+        );
+      }
+
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+
+    // If any photos uploaded, include accessible URLs
+    const photosRes = await pool.query(`SELECT id, report_id, url, caption FROM report_photos WHERE report_id = $1 ORDER BY taken_at DESC`, [reportRow.id]);
+    const resp = { ...reportRow, photos: photosRes.rows };
+
+    // Mark task as completed when a report is created for it
+    if (taskId) {
+      try {
+        await pool.query(`UPDATE tasks SET status = 'completed' WHERE id = $1`, [taskId]);
+      } catch (err) {
+        // don't fail the report creation if status update fails, but log
+        console.error('Failed to update task status to completed after report:', err.message || err);
+      }
+    }
+
+    return res.status(201).json({ success: true, data: resp });
   })
 );
 

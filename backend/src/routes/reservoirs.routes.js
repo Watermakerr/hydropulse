@@ -98,7 +98,14 @@ router.get(
       values
     );
 
-    return res.json({ success: true, data: result.rows });
+    // Compatibility: include Mongo-like shape expected by older mobile app
+    const formatted = result.rows.map((r) => ({
+      ...r,
+      _id: r.id,
+      boundary: r.boundary_geojson || null
+    }));
+
+    return res.json({ success: true, data: formatted });
   })
 );
 

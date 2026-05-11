@@ -8,7 +8,7 @@ import {
 } from 'lucide-react';
 import L from 'leaflet';
 import { useSearchParams } from 'react-router-dom';
-import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory } from '../services/api';
+import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory, LocationLogRaw } from '../services/api';
 
 const SENTINEL2_TILE_URL = (import.meta.env.VITE_SENTINEL2_TILE_URL || '').trim();
 const SENTINEL2_ATTRIBUTION =
@@ -202,6 +202,7 @@ export default function Reservoirs() {
   const [selectedTaskId, setSelectedTaskId] = useState<string>('');
   const [taskReports, setTaskReports] = useState<TaskReport[]>([]);
   const [taskPhotos, setTaskPhotos] = useState<ReportPhoto[]>([]);
+  const [taskLocationLogs, setTaskLocationLogs] = useState<LocationLogRaw[]>([]);
   const [taskLoading, setTaskLoading] = useState(false);
   const [satelliteHistory, setSatelliteHistory] = useState<SatelliteHistory[]>([]);
   const [satelliteLoading, setSatelliteLoading] = useState(false);
@@ -303,6 +304,7 @@ export default function Reservoirs() {
     if (!taskId) {
       setTaskReports([]);
       setTaskPhotos([]);
+      setTaskLocationLogs([]);
       return;
     }
 
@@ -310,6 +312,9 @@ export default function Reservoirs() {
     try {
       const reports = await api.getTaskReports(taskId);
       setTaskReports(reports);
+
+      const locationLogs = await api.getTaskLocationLogs(taskId);
+      setTaskLocationLogs(locationLogs);
 
       if (!reports.length) {
         setTaskPhotos([]);
@@ -321,6 +326,7 @@ export default function Reservoirs() {
     } catch (e) {
       setTaskReports([]);
       setTaskPhotos([]);
+      setTaskLocationLogs([]);
       setError(e instanceof Error ? e.message : 'Không thể tải thông tin task');
     } finally {
       setTaskLoading(false);
@@ -1183,6 +1189,31 @@ export default function Reservoirs() {
                               </div>
                             );
                           })}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Location Trail */}
+                    <div>
+                      <h4 className="text-sm font-black text-primary mb-3 flex items-center gap-2">
+                        <MapPin className="w-4 h-4" /> Lịch sử vị trí
+                      </h4>
+                      {!taskLoading && !taskLocationLogs.length && (
+                        <p className="text-xs text-on-surface-variant bg-surface-container rounded-xl p-4 text-center">Chưa có dữ liệu vị trí nào</p>
+                      )}
+                      {taskLocationLogs.length > 0 && (
+                        <div className="space-y-2 max-h-[320px] overflow-y-auto custom-scrollbar">
+                          {taskLocationLogs.map((log, idx) => (
+                            <div key={log.id} className="border border-slate-100 rounded-xl p-3 bg-white hover:shadow-sm transition-shadow">
+                              <div className="flex items-start justify-between mb-1.5">
+                                <span className="text-[10px] font-bold bg-primary-fixed text-primary px-2 py-1 rounded-full">#{idx + 1}</span>
+                                <span className="text-[10px] text-on-surface-variant">{new Date(log.recorded_at).toLocaleString('vi-VN')}</span>
+                              </div>
+                              <p className="text-[11px] font-mono text-on-surface-variant">
+                                📍 {log.location_geojson.coordinates[1].toFixed(6)}, {log.location_geojson.coordinates[0].toFixed(6)}
+                              </p>
+                            </div>
+                          ))}
                         </div>
                       )}
                     </div>

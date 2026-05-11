@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Calendar, CheckCircle2, PlusCircle, X } from 'lucide-react';
-import { api, Reservoir, Task, User } from '../services/api';
+import { api, Marker, Reservoir, Task, User } from '../services/api';
 
 type TaskForm = {
   title: string;
   description: string;
   reservoirId: string;
+  markerId: string;
   assignedTo: string;
   priority: 'low' | 'medium' | 'high' | 'urgent';
   dueDate: string;
@@ -15,6 +16,7 @@ const initialForm: TaskForm = {
   title: '',
   description: '',
   reservoirId: '',
+  markerId: '',
   assignedTo: '',
   priority: 'medium',
   dueDate: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10)
@@ -24,11 +26,34 @@ export default function TaskManagement() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [reservoirs, setReservoirs] = useState<Reservoir[]>([]);
+  const [markers, setMarkers] = useState<Marker[]>([]);
   const [workers, setWorkers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [form, setForm] = useState<TaskForm>(initialForm);
+
+  const loadMarkers = async (reservoirId: string, preferredMarkerId?: string) => {
+    if (!reservoirId) {
+      setMarkers([]);
+      setForm((prev) => ({ ...prev, markerId: '' }));
+      return;
+    }
+
+    const markerRows = await api.getMarkers(reservoirId);
+    setMarkers(markerRows);
+
+    setForm((prev) => {
+      const fallbackMarkerId = markerRows[0]?.id || '';
+      const hasPreferred = preferredMarkerId && markerRows.some((m) => m.id === preferredMarkerId);
+      const hasCurrent = prev.markerId && markerRows.some((m) => m.id === prev.markerId);
+
+      return {
+        ...prev,
+        markerId: hasPreferred ? preferredMarkerId : hasCurrent ? prev.markerId : fallbackMarkerId
+      };
+    });
+  };
 
   const loadData = async () => {
     const [taskRows, reservoirRows, userRows] = await Promise.all([
@@ -42,11 +67,15 @@ export default function TaskManagement() {
     setReservoirs(reservoirRows);
     setWorkers(workerRows);
 
+    const nextReservoirId = form.reservoirId || reservoirRows[0]?.id || '';
+
     setForm((prev) => ({
       ...prev,
-      reservoirId: prev.reservoirId || reservoirRows[0]?.id || '',
+      reservoirId: prev.reservoirId || nextReservoirId,
       assignedTo: prev.assignedTo || workerRows[0]?.id || ''
     }));
+
+    await loadMarkers(nextReservoirId);
   };
 
   useEffect(() => {
@@ -78,6 +107,7 @@ export default function TaskManagement() {
     try {
       await api.createTask({
         reservoirId: form.reservoirId,
+        markerId: form.markerId || undefined,
         assignedTo: form.assignedTo || undefined,
         title: form.title,
         description: form.description,
@@ -86,11 +116,10 @@ export default function TaskManagement() {
       });
       await loadData();
       setIsModalOpen(false);
-      setForm({
-        ...initialForm,
-        reservoirId: reservoirs[0]?.id || '',
-        assignedTo: workers[0]?.id || ''
-      });
+      const nextReservoirId = reservoirs[0]?.id || '';
+      const nextAssignedTo = workers[0]?.id || '';
+      setForm({ ...initialForm, reservoirId: nextReservoirId, assignedTo: nextAssignedTo, markerId: '' });
+      await loadMarkers(nextReservoirId);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Tao task that bai');
     } finally {
@@ -265,19 +294,47 @@ export default function TaskManagement() {
                   onChange={(e) => setForm({ ...form, title: e.target.value })}
                 />
               </div>
-              <div className="grid grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Hồ chứa</label>
                   <select
                     className="w-full bg-surface-container-highest border-none rounded-lg focus:ring-2 focus:ring-surface-tint p-3 text-sm outline-none"
                     value={form.reservoirId}
-                    onChange={(e) => setForm({ ...form, reservoirId: e.target.value })}
+                    onChange={async (e) => {
+                      const nextReservoirId = e.target.value;
+                      setForm((prev) => ({ ...prev, reservoirId: nextReservoirId, markerId: '' }));
+                      try {
+                        setError(null);
+                        await loadMarkers(nextReservoirId);
+                      } catch (err) {
+                        setError(err instanceof Error ? err.message : 'Khong the tai danh sach moc giam sat');
+                      }
+                    }}
                   >
                     {reservoirs.map((r) => (
                       <option value={r.id} key={r.id}>
                         {r.name}
                       </option>
                     ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Mốc giám sát</label>
+                  <select
+                    className="w-full bg-surface-container-highest border-none rounded-lg focus:ring-2 focus:ring-surface-tint p-3 text-sm outline-none"
+                    value={form.markerId}
+                    onChange={(e) => setForm({ ...form, markerId: e.target.value })}
+                    disabled={!form.reservoirId || !markers.length}
+                  >
+                    {!markers.length ? (
+                      <option value="">Khong co moc cho ho nay</option>
+                    ) : (
+                      markers.map((m) => (
+                        <option value={m.id} key={m.id}>
+                          {m.code} - {m.name}
+                        </option>
+                      ))
+                    )}
                   </select>
                 </div>
                 <div>

@@ -91,14 +91,25 @@ router.post(
     const { fullName, email, password, role = 'worker' } = req.body;
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const result = await pool.query(
-      `INSERT INTO users (full_name, email, password_hash, role)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, full_name, email, role, is_active, created_at`,
-      [fullName, email, passwordHash, role]
-    );
+    try {
+      const result = await pool.query(
+        `INSERT INTO users (full_name, email, password_hash, role)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, full_name, email, role, is_active, created_at`,
+        [fullName, email, passwordHash, role]
+      );
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+      res.status(201).json({ success: true, data: result.rows[0] });
+    } catch (error) {
+      if (error.code === '23505') {
+        return res.status(409).json({
+          success: false,
+          message: 'Email đã tồn tại. Vui lòng dùng email khác.'
+        });
+      }
+
+      throw error;
+    }
   })
 );
 

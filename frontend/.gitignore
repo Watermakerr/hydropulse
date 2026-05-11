@@ -1,8 +1,36 @@
+# Dependencies
 node_modules/
+package-lock.json
+
+# Build outputs
 build/
 dist/
 coverage/
-.DS_Store
-*.log
+.vite/
+
+# Test outputs
+test_output.txt
+test*.txt
+
+# Environment & Secrets
 .env*
 !.env.example
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+*.ipr
+*.iws
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

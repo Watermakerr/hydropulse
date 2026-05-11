@@ -86,6 +86,17 @@ interface TaskReportRaw {
   } | null;
 }
 
+export interface LocationLogRaw {
+  id: string;
+  task_id: string;
+  worker_id: string;
+  recorded_at: string;
+  location_geojson: {
+    type: 'Point';
+    coordinates: [number, number];
+  };
+}
+
 interface ReportPhotoRaw {
   id: string;
   report_id: string;
@@ -723,6 +734,10 @@ export const api = {
   getTaskReports: async (taskId: string): Promise<TaskReport[]> => {
     const rows = await request<TaskReportRaw[]>(`/api/reports/task/${taskId}`);
     return rows.map(mapTaskReport);
+  },
+
+  getTaskLocationLogs: async (taskId: string): Promise<LocationLogRaw[]> => {
+    return request<LocationLogRaw[]>(`/api/tasks/${taskId}/location-logs`);
   },
 
   uploadReportPhoto: async (reportId: string, file: File, caption?: string): Promise<ReportPhoto> => {
