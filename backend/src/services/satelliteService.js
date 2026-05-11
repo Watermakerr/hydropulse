@@ -130,7 +130,12 @@ class SatelliteService {
       // Sort by cloud cover (ascending), then by date (descending)
       const cloudDiff = a.properties.cloud_cover - b.properties.cloud_cover;
       if (Math.abs(cloudDiff) > 0.05) return cloudDiff;
-      return new Date(b.properties.acquired) - new Date(a.properties.acquired);
+      
+      const dateDiff = new Date(b.properties.acquired).getTime() - new Date(a.properties.acquired).getTime();
+      if (dateDiff !== 0) return dateDiff;
+      
+      // Final tie-breaker: deterministic ID sort
+      return b.id.localeCompare(a.id);
     })[0];
 
     const sceneProps = bestScene.properties;
@@ -182,10 +187,10 @@ class SatelliteService {
    * Save analysis result and calculate change alerts
    */
   async saveAnalysis(reservoirId, date, area, rawResponse) {
-    // Get previous record for change calculation
+    // Get previous record for change calculation (must be before current analysis date)
     const prevRecord = await pool.query(
-      'SELECT water_surface_area FROM satellite_analysis WHERE reservoir_id = $1 ORDER BY capture_date DESC LIMIT 1',
-      [reservoirId]
+      'SELECT water_surface_area FROM satellite_analysis WHERE reservoir_id = $1 AND capture_date < $2 ORDER BY capture_date DESC LIMIT 1',
+      [reservoirId, date]
     );
 
     let changePercentage = 0;

@@ -1,7 +1,7 @@
 const express = require('express');
 const multer = require('multer');
 const { body, param } = require('express-validator');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 const pool = require('../db/pool');
 const validate = require('../middlewares/validate');
@@ -206,7 +206,7 @@ router.post(
     }
 
     const reportId = req.params.id;
-    const blobName = `reports/${reportId}/${Date.now()}-${uuidv4()}-${req.file.originalname}`;
+    const blobName = `reports/${reportId}/${Date.now()}-${crypto.randomUUID()}-${req.file.originalname}`;
 
     let uploadStatus = 'uploaded';
     let uploadError = null;
