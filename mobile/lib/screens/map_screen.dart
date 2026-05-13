@@ -4,6 +4,7 @@ import 'package:latlong2/latlong.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/location_service.dart';
 import 'package:hive/hive.dart';
+import 'package:hive_flutter/hive_flutter.dart';
 
 // Import service
 import '../services/lake_service.dart';
@@ -153,7 +154,8 @@ class _MapScreenState extends State<MapScreen> {
                                     id: task.id, 
                                     title: task.title, 
                                     position: task.position, 
-                                    status: 'completed'
+                                    status: 'completed',
+                                    template: task.template
                                   ));
                                 },
                                 child: Icon(Icons.location_on, color: Colors.green, size: 40.0),
@@ -253,11 +255,16 @@ class _MapScreenState extends State<MapScreen> {
             ListTile(
               leading: Icon(Icons.cloud_sync, color: Colors.orange),
               title: Text('Dữ liệu chờ đồng bộ'),
-              trailing: Container(
-                padding: EdgeInsets.all(6),
-                decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
-                // Lấy số lượng từ Hive thay vì để số '0' cứng
-                child: Text('${Hive.box('offline_reports_box').length}', style: TextStyle(color: Colors.white, fontSize: 12)), 
+              trailing: ValueListenableBuilder(
+                valueListenable: Hive.box('offline_reports_box').listenable(),
+                builder: (context, Box box, _) {
+                  final count = box.length;
+                  return Container(
+                    padding: EdgeInsets.all(6),
+                    decoration: BoxDecoration(color: Colors.red, shape: BoxShape.circle),
+                    child: Text('$count', style: TextStyle(color: Colors.white, fontSize: 12)),
+                  );
+                },
               ),
               onTap: () {
                 Navigator.pop(context); // Đóng menu

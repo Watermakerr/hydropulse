@@ -107,6 +107,43 @@ const conditionStatusColor: Record<string, { bg: string; text: string }> = {
   destroyed: { bg: 'bg-red-50', text: 'text-red-700' }
 };
 
+const conditionStatusOptions = [
+  { value: 'good', label: 'Tốt' },
+  { value: 'minor_damage', label: 'Nhẹ' },
+  { value: 'major_damage', label: 'Nguy hiểm' },
+  { value: 'destroyed', label: 'Khẩn cấp' }
+] as const;
+
+const reportFieldLabels: Record<string, string> = {
+  template: 'Mẫu biểu',
+  crackDetected: 'Có vết nứt',
+  crackWidth: 'Độ rộng vết nứt (mm)',
+  crackLength: 'Độ dài vết nứt (cm)',
+  waterLeak: 'Có thấm nước',
+  dangerLevel: 'Mức độ nguy hiểm',
+  gateStatus: 'Tình trạng cửa xả',
+  motorNoise: 'Có tiếng động lạ',
+  rustDetected: 'Có rỉ sét',
+  openCloseTest: 'Test đóng/mở',
+  waterLevel: 'Mực nước hiện tại (m)',
+  flowRate: 'Lưu lượng nước vào (m3/s)',
+  rainStatus: 'Tình trạng mưa',
+  floodRisk: 'Nguy cơ lũ',
+  landslideDetected: 'Có sạt lở',
+  affectedArea: 'Diện tích ảnh hưởng (m2)',
+  roadBlocked: 'Có chắn đường',
+  encroachmentDetected: 'Phát hiện xâm lấn',
+  encroachmentType: 'Loại xâm lấn',
+  estimatedArea: 'Diện tích xâm lấn (m2)',
+  peopleCount: 'Số người liên quan',
+  temporaryOrPermanent: 'Mức độ công trình',
+  riskLevel: 'Mức độ ảnh hưởng',
+  gpsLocation: 'Vị trí GPS',
+  note: 'Ghi chú',
+  description: 'Mô tả chi tiết',
+  recommendation: 'Đề xuất xử lý'
+};
+
 type ReservoirForm = {
   name: string;
   description: string;
@@ -192,6 +229,33 @@ function MapClickCapture({
   return null;
 }
 
+function formatReportLabel(key: string) {
+  if (reportFieldLabels[key]) {
+    return reportFieldLabels[key];
+  }
+  return key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ');
+}
+
+function formatReportValue(value: unknown): string {
+  if (value === null || value === undefined) {
+    return 'N/A';
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'Có' : 'Không';
+  }
+  if (Array.isArray(value)) {
+    return value.length ? value.map((item) => formatReportValue(item)).join(', ') : 'N/A';
+  }
+  if (typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    if (typeof obj.lat === 'number' && typeof obj.lng === 'number') {
+      return `${obj.lat.toFixed(6)}, ${obj.lng.toFixed(6)}`;
+    }
+    return JSON.stringify(obj);
+  }
+  return String(value);
+}
+
 /* ─── Main Component ─────────────────────────────────────────────── */
 export default function Reservoirs() {
   const [searchParams] = useSearchParams();
@@ -204,6 +268,7 @@ export default function Reservoirs() {
   const [taskPhotos, setTaskPhotos] = useState<ReportPhoto[]>([]);
   const [taskLocationLogs, setTaskLocationLogs] = useState<LocationLogRaw[]>([]);
   const [taskLoading, setTaskLoading] = useState(false);
+  const [reportDraft, setReportDraft] = useState({ description: '', conditionStatus: 'good' });
   const [satelliteHistory, setSatelliteHistory] = useState<SatelliteHistory[]>([]);
   const [satelliteLoading, setSatelliteLoading] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -464,6 +529,26 @@ export default function Reservoirs() {
       setReservoirModalOpen(false);
       await loadReservoirs(currentReservoir.id);
       await loadMarkers(currentReservoir.id);
+    });
+  };
+
+  const submitReportDraft = async () => {
+    if (!currentTask) {
+      return;
+    }
+    if (!reportDraft.description.trim()) {
+      setError('Vui long nhap mo ta bao cao');
+      return;
+    }
+
+    await withAction(async () => {
+      await api.createReport({
+        taskId: currentTask.id,
+        description: reportDraft.description.trim(),
+        conditionStatus: reportDraft.conditionStatus as TaskReport['condition_status']
+      });
+      setReportDraft({ description: '', conditionStatus: 'good' });
+      await loadTaskEvidence(currentTask.id);
     });
   };
 
@@ -1173,6 +1258,45 @@ export default function Reservoirs() {
                       <h4 className="text-sm font-black text-primary mb-3 flex items-center gap-2">
                         <FileText className="w-4 h-4" /> Báo cáo hiện trường
                       </h4>
+                      {currentTask && (
+                        <div className="bg-surface-container-lowest border border-slate-100 rounded-xl p-4 mb-4">
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                            <div className="md:col-span-2">
+                              <label className="block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant mb-2">Mô tả báo cáo</label>
+                              <textarea
+                                className="w-full rounded-lg border border-slate-200 bg-white p-3 text-xs outline-none focus:ring-2 focus:ring-primary/10"
+                                rows={3}
+                                placeholder="Nhập mô tả hiện trường..."
+                                value={reportDraft.description}
+                                onChange={(e) => setReportDraft({ ...reportDraft, description: e.target.value })}
+                                disabled={taskLoading || working}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-bold uppercase tracking-widest text-on-surface-variant mb-2">Tình trạng</label>
+                              <select
+                                className="w-full rounded-lg border border-slate-200 bg-white p-3 text-xs outline-none focus:ring-2 focus:ring-primary/10"
+                                value={reportDraft.conditionStatus}
+                                onChange={(e) => setReportDraft({ ...reportDraft, conditionStatus: e.target.value })}
+                                disabled={taskLoading || working}
+                              >
+                                {conditionStatusOptions.map((option) => (
+                                  <option key={option.value} value={option.value}>
+                                    {option.label}
+                                  </option>
+                                ))}
+                              </select>
+                              <button
+                                className="mt-3 w-full px-4 py-2 rounded-lg bg-primary text-white text-xs font-bold hover:bg-primary/90 disabled:opacity-50"
+                                onClick={submitReportDraft}
+                                disabled={taskLoading || working || !reportDraft.description.trim()}
+                              >
+                                Lưu báo cáo
+                              </button>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                       {taskLoading && (
                         <div className="space-y-2">
                           {[1, 2].map((i) => <div key={i} className="h-16 rounded-xl shimmer"></div>)}
@@ -1185,8 +1309,12 @@ export default function Reservoirs() {
                         <div className="space-y-2">
                           {taskReports.map((report) => {
                             const cColor = conditionStatusColor[report.condition_status] || conditionStatusColor.good;
+                            const formEntries = report.form_data
+                              ? Object.entries(report.form_data).filter(([key]) => !['photos', 'template', 'conditionStatus'].includes(key))
+                              : [];
+                            const hasLegacyDetails = Boolean(report.weather || report.damage_type || report.water_level !== null);
                             return (
-                              <div key={report.id} className="border border-slate-100 rounded-xl p-3.5 bg-white hover:shadow-sm transition-shadow">
+                              <div key={report.id} className="border border-slate-100 rounded-xl p-4 bg-white hover:shadow-sm transition-shadow">
                                 <div className="flex items-center justify-between mb-1">
                                   <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${cColor.bg} ${cColor.text}`}>
                                     {conditionStatusVi[report.condition_status] || report.condition_status}
@@ -1195,7 +1323,49 @@ export default function Reservoirs() {
                                     {new Date(report.reported_at).toLocaleString('vi-VN')}
                                   </span>
                                 </div>
-                                <p className="text-[11px] text-on-surface-variant mt-1">{report.description || 'Không có mô tả'}</p>
+                                <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-2">
+                                  <div className="bg-surface-container rounded-lg p-2">
+                                    <div className="text-[10px] text-on-surface-variant font-semibold">Mô tả</div>
+                                    <div className="text-[11px] text-on-surface mt-1">
+                                        {report.description || 'Chưa có mô tả'}
+                                    </div>
+                                  </div>
+                                  {hasLegacyDetails && (
+                                    <>
+                                      <div className="bg-surface-container rounded-lg p-2">
+                                          <div className="text-[10px] text-on-surface-variant font-semibold">Thời tiết</div>
+                                          <div className="text-[11px] text-on-surface mt-1">{report.weather || 'N/A'}</div>
+                                      </div>
+                                      <div className="bg-surface-container rounded-lg p-2">
+                                          <div className="text-[10px] text-on-surface-variant font-semibold">Mực nước</div>
+                                        <div className="text-[11px] text-on-surface mt-1">
+                                          {report.water_level ?? 'N/A'}
+                                        </div>
+                                      </div>
+                                      <div className="bg-surface-container rounded-lg p-2">
+                                          <div className="text-[10px] text-on-surface-variant font-semibold">Loại hư hỏng</div>
+                                        <div className="text-[11px] text-on-surface mt-1">{report.damage_type || 'N/A'}</div>
+                                      </div>
+                                    </>
+                                  )}
+                                </div>
+                                {formEntries.length > 0 && (
+                                  <div className="mt-3">
+                                      <div className="text-[10px] font-semibold text-on-surface-variant mb-2">Dữ liệu form</div>
+                                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                      {formEntries.map(([key, value]) => (
+                                        <div key={key} className="bg-surface-container rounded-lg p-2">
+                                          <div className="text-[10px] text-on-surface-variant font-semibold">
+                                            {formatReportLabel(key)}
+                                          </div>
+                                          <div className="text-[11px] text-on-surface mt-1 break-words">
+                                            {formatReportValue(value)}
+                                          </div>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
                               </div>
                             );
                           })}

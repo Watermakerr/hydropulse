@@ -55,7 +55,7 @@ router.get(
     }
 
     const result = await pool.query(
-      `SELECT id, task_id, worker_id, description, condition_status, sync_status, reported_at,
+      `SELECT id, task_id, worker_id, description, condition_status, weather, water_level, damage_type, template, form_data, sync_status, reported_at,
               CASE WHEN location IS NULL THEN NULL ELSE ST_AsGeoJSON(location)::json END AS location_geojson
        FROM task_reports
        WHERE task_id = $1
@@ -147,7 +147,12 @@ router.post(
   [
     body('taskId').optional().isUUID(),
     body('description').optional().isString(),
-    body('conditionStatus').optional().isIn(['good', 'minor_damage', 'major_damage', 'destroyed'])
+    body('conditionStatus').optional().isIn(['good', 'minor_damage', 'major_damage', 'destroyed']),
+    body('weather').optional().isString(),
+    body('waterLevel').optional().isFloat(),
+    body('damageType').optional().isString(),
+    body('template').optional().isString().isLength({ min: 2, max: 100 }),
+    body('formData').optional()
   ],
   validate,
   asyncHandler(async (req, res) => {
@@ -158,7 +163,24 @@ router.post(
     let taskId = req.body.taskId;
     let description = req.body.description || req.body.notes || null;
     let conditionStatus = req.body.conditionStatus || 'good';
+    let weather = req.body.weather || null;
+    let waterLevel = req.body.waterLevel ?? null;
+    let damageType = req.body.damageType || null;
     let locationGeoJSON = null;
+    let formData = null;
+    let template = req.body.template || null;
+
+    if (req.body.formData) {
+      if (typeof req.body.formData === 'string') {
+        try {
+          formData = JSON.parse(req.body.formData);
+        } catch (error) {
+          return res.status(400).json({ success: false, message: 'formData khong hop le' });
+        }
+      } else {
+        formData = req.body.formData;
+      }
+    }
 
     if (isMultipart && req.body.coordinates) {
       const coords = req.body.coordinates.split(',').map(Number);
@@ -176,16 +198,35 @@ router.post(
       await client.query('BEGIN');
 
       const insertRes = await client.query(
-        `INSERT INTO task_reports (task_id, worker_id, description, condition_status, location, sync_status)
-         VALUES ($1, $2, $3, $4,
-                 CASE WHEN $5::text IS NULL THEN NULL ELSE ST_SetSRID(ST_GeomFromGeoJSON($5),4326) END,
-                 'pending')
-         RETURNING id, task_id, worker_id, description, condition_status, sync_status, reported_at,
-                   CASE WHEN location IS NULL THEN NULL ELSE ST_AsGeoJSON(location)::json END AS location_geojson`,
-        [taskId, req.user.sub, description || null, conditionStatus, locationGeoJSON ? JSON.stringify(locationGeoJSON) : null]
+        `INSERT INTO task_reports (task_id, worker_id, description, condition_status, weather, water_level, damage_type, template, form_data, location, sync_status)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+           CASE WHEN $10::text IS NULL THEN NULL ELSE ST_SetSRID(ST_GeomFromGeoJSON($10),4326) END,
+           'pending')
+         RETURNING id, task_id, worker_id, description, condition_status, weather, water_level, damage_type, template, form_data, sync_status, reported_at,
+             CASE WHEN location IS NULL THEN NULL ELSE ST_AsGeoJSON(location)::json END AS location_geojson`,
+        [
+          taskId,
+          req.user.sub,
+          description || null,
+          conditionStatus,
+          weather,
+          waterLevel,
+          damageType,
+          template,
+          formData ? JSON.stringify(formData) : null,
+          locationGeoJSON ? JSON.stringify(locationGeoJSON) : null
+        ]
       );
 
       reportRow = insertRes.rows[0];
+
+      if (taskId && locationGeoJSON) {
+        await client.query(
+          `INSERT INTO task_location_logs (task_id, worker_id, location, recorded_at)
+           VALUES ($1, $2, ST_SetSRID(ST_GeomFromGeoJSON($3),4326), NOW())`,
+          [taskId, req.user.sub, JSON.stringify(locationGeoJSON)]
+        );
+      }
 
       // If photos were uploaded, store them using blobStorage and create report_photos rows
       if (isMultipart && req.files.length) {

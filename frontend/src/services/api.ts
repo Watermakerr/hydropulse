@@ -66,6 +66,7 @@ interface TaskRaw {
   assigned_to_name?: string | null;
   title: string;
   description: string | null;
+  template?: string | null;
   status: TaskStatus;
   priority: TaskPriority;
   due_date: string | null;
@@ -78,6 +79,11 @@ interface TaskReportRaw {
   worker_id: string;
   description: string | null;
   condition_status: ConditionStatus;
+  weather?: string | null;
+  water_level?: number | null;
+  damage_type?: string | null;
+  template?: string | null;
+  form_data?: Record<string, unknown> | null;
   sync_status: 'pending' | 'synced' | 'failed';
   reported_at: string;
   location_geojson: {
@@ -165,6 +171,7 @@ export interface Task {
   assigned_to_name?: string;
   title: string;
   description: string;
+  template?: string;
   status: TaskStatus;
   priority: TaskPriority;
   due_date: string;
@@ -212,6 +219,11 @@ export interface TaskReport {
   worker_id: string;
   description: string | null;
   condition_status: ConditionStatus;
+  weather?: string | null;
+  water_level?: number | null;
+  damage_type?: string | null;
+  template?: string | null;
+  form_data?: Record<string, unknown> | null;
   sync_status: 'pending' | 'synced' | 'failed';
   reported_at: string;
   location_geojson: {
@@ -330,6 +342,7 @@ function mapTask(row: TaskRaw): Task {
     assigned_to_name: row.assigned_to_name || 'Chua phan cong',
     title: row.title,
     description: row.description || '',
+    template: row.template || undefined,
     status: row.status,
     priority: row.priority,
     due_date: row.due_date || new Date().toISOString(),
@@ -344,6 +357,11 @@ function mapTaskReport(row: TaskReportRaw): TaskReport {
     worker_id: row.worker_id,
     description: row.description,
     condition_status: row.condition_status,
+    weather: row.weather ?? null,
+    water_level: row.water_level ?? null,
+    damage_type: row.damage_type ?? null,
+    template: row.template ?? null,
+    form_data: row.form_data ?? null,
     sync_status: row.sync_status,
     reported_at: row.reported_at,
     location_geojson: row.location_geojson
@@ -672,6 +690,7 @@ export const api = {
     assignedTo?: string;
     title: string;
     description?: string;
+    template?: string;
     status?: TaskStatus;
     priority?: TaskPriority;
     dueDate?: string;
@@ -688,6 +707,7 @@ export const api = {
     payload: {
       title?: string;
       description?: string;
+      template?: string;
       status?: TaskStatus;
       priority?: TaskPriority;
       assignedTo?: string;

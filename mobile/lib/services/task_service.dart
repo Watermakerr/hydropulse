@@ -12,8 +12,15 @@ class TaskMarker {
   final String title;
   final LatLng position;
   final String status;
+  final String template;
 
-  TaskMarker({required this.id, required this.title, required this.position, required this.status});
+  TaskMarker({
+    required this.id,
+    required this.title,
+    required this.position,
+    required this.status,
+    required this.template
+  });
 }
 
 class TaskService {
@@ -93,6 +100,7 @@ class TaskService {
           title: task['title'] ?? 'Nhiệm vụ chưa có tên',
           position: LatLng(_toDouble(coordinates[1]), _toDouble(coordinates[0])), // Đảo lng/lat
           status: task['status'] ?? 'pending',
+          template: task['template'] ?? '',
         ));
       } catch (e) {
         print('Lỗi parse 1 task: $e');

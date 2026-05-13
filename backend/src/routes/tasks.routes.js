@@ -117,12 +117,12 @@ router.get(
 
     // Compatibility: add Mongo-like `_id` and `coordinates` fields for mobile client
     const formatted = result.rows.map((row) => {
-      const coords = row.location_geojson && row.location_geojson.coordinates ? row.location_geojson.coordinates : null;
+      const coords = row.marker_location_geojson && row.marker_location_geojson.coordinates ? row.marker_location_geojson.coordinates : null;
       return {
         ...row,
         _id: row.id,
         coordinates: coords,
-        location: row.location_geojson || (coords ? { type: 'Point', coordinates: coords } : null)
+        location: row.marker_location_geojson || (coords ? { type: 'Point', coordinates: coords } : null)
       };
     });
 
@@ -148,12 +148,23 @@ router.post(
     body('markerId').optional().isUUID(),
     body('assignedTo').optional().isUUID(),
     body('title').isString().isLength({ min: 3 }),
+    body('template').optional().isString().isLength({ min: 2, max: 100 }),
     body('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
     body('priority').optional().isIn(['low', 'medium', 'high', 'urgent'])
   ],
   validate,
   asyncHandler(async (req, res) => {
-    const { reservoirId, markerId, assignedTo, title, description, status = 'pending', priority = 'medium', dueDate } = req.body;
+    const {
+      reservoirId,
+      markerId,
+      assignedTo,
+      title,
+      description,
+      template,
+      status = 'pending',
+      priority = 'medium',
+      dueDate
+    } = req.body;
 
     if (assignedTo) {
       const workerEligible = await isAssignableWorker(assignedTo);
@@ -170,10 +181,21 @@ router.post(
     }
 
     const result = await pool.query(
-      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, title, description, status, priority, due_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, title, description, template, status, priority, due_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING *`,
-      [reservoirId, markerId || null, assignedTo || null, req.user.sub, title, description || null, status, priority, dueDate || null]
+      [
+        reservoirId,
+        markerId || null,
+        assignedTo || null,
+        req.user.sub,
+        title,
+        description || null,
+        template || null,
+        status,
+        priority,
+        dueDate || null
+      ]
     );
 
     if (assignedTo) {
@@ -215,6 +237,7 @@ router.patch(
     param('id').isUUID(),
     body('title').optional().isString().isLength({ min: 3 }),
     body('description').optional().isString(),
+    body('template').optional().isString().isLength({ min: 2, max: 100 }),
     body('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
     body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
     body('assignedTo').optional({ nullable: true }).isUUID(),
@@ -224,7 +247,7 @@ router.patch(
   validate,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { title, description, status, priority, assignedTo, markerId, dueDate } = req.body;
+    const { title, description, template, status, priority, assignedTo, markerId, dueDate } = req.body;
     const hasAssignedTo = Object.prototype.hasOwnProperty.call(req.body, 'assignedTo');
     const hasMarkerId = Object.prototype.hasOwnProperty.call(req.body, 'markerId');
     const hasDueDate = Object.prototype.hasOwnProperty.call(req.body, 'dueDate');
@@ -252,16 +275,18 @@ router.patch(
       `UPDATE tasks
        SET title = COALESCE($1, title),
            description = COALESCE($2, description),
-           status = COALESCE($3, status),
-           priority = COALESCE($4, priority),
-           assigned_to = CASE WHEN $5::boolean THEN $6::uuid ELSE assigned_to END,
-           marker_id = CASE WHEN $7::boolean THEN $8::uuid ELSE marker_id END,
-           due_date = CASE WHEN $9::boolean THEN $10::date ELSE due_date END
-       WHERE id = $11
+           template = COALESCE($3, template),
+           status = COALESCE($4, status),
+           priority = COALESCE($5, priority),
+           assigned_to = CASE WHEN $6::boolean THEN $7::uuid ELSE assigned_to END,
+           marker_id = CASE WHEN $8::boolean THEN $9::uuid ELSE marker_id END,
+           due_date = CASE WHEN $10::boolean THEN $11::date ELSE due_date END
+       WHERE id = $12
        RETURNING *`,
       [
         title || null,
         description || null,
+        template || null,
         status || null,
         priority || null,
         hasAssignedTo,

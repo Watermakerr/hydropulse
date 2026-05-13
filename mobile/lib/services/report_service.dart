@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart'; // THÊM DÒNG NÀY ĐỂ ÉP KIỂU FILE
@@ -21,6 +22,24 @@ class ReportService {
       request.fields['taskId'] = reportData['taskId'];
       request.fields['inspectorId'] = inspectorId;
       request.fields['notes'] = reportData['notes'] ?? '';
+      if (reportData['conditionStatus'] != null && reportData['conditionStatus'].toString().isNotEmpty) {
+        request.fields['conditionStatus'] = reportData['conditionStatus'].toString();
+      }
+      if (reportData['weather'] != null && reportData['weather'].toString().isNotEmpty) {
+        request.fields['weather'] = reportData['weather'].toString();
+      }
+      if (reportData['waterLevel'] != null && reportData['waterLevel'].toString().isNotEmpty) {
+        request.fields['waterLevel'] = reportData['waterLevel'].toString();
+      }
+      if (reportData['damageType'] != null && reportData['damageType'].toString().isNotEmpty) {
+        request.fields['damageType'] = reportData['damageType'].toString();
+      }
+      if (reportData['template'] != null && reportData['template'].toString().isNotEmpty) {
+        request.fields['template'] = reportData['template'].toString();
+      }
+      if (reportData['formData'] != null) {
+        request.fields['formData'] = jsonEncode(reportData['formData']);
+      }
       
       List<dynamic> coords = reportData['coordinates'];
       request.fields['coordinates'] = '${coords[0]},${coords[1]}';

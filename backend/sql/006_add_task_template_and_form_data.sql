@@ -1,0 +1,5 @@
+ALTER TABLE tasks
+  ADD COLUMN IF NOT EXISTS template TEXT;
+
+ALTER TABLE task_reports
+  ADD COLUMN IF NOT EXISTS form_data JSONB;

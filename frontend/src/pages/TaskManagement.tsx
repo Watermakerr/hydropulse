@@ -5,6 +5,7 @@ import { api, Marker, Reservoir, Task, User } from '../services/api';
 type TaskForm = {
   title: string;
   description: string;
+  template: string;
   reservoirId: string;
   markerId: string;
   assignedTo: string;
@@ -12,9 +13,18 @@ type TaskForm = {
   dueDate: string;
 };
 
+const taskTemplates = [
+  { value: 'DamInspection', label: 'Kiểm tra thân đập' },
+  { value: 'SpillwayInspection', label: 'Kiểm tra cửa xả' },
+  { value: 'WaterLevelInspection', label: 'Kiểm tra mực nước' },
+  { value: 'LandslideInspection', label: 'Kiểm tra sạt lở' },
+  { value: 'EncroachmentInspection', label: 'Kiểm tra xâm nhập hồ chứa' }
+];
+
 const initialForm: TaskForm = {
   title: '',
   description: '',
+  template: taskTemplates[0].value,
   reservoirId: '',
   markerId: '',
   assignedTo: '',
@@ -111,6 +121,7 @@ export default function TaskManagement() {
         assignedTo: form.assignedTo || undefined,
         title: form.title,
         description: form.description,
+        template: form.template,
         priority: form.priority,
         dueDate: form.dueDate
       });
@@ -293,6 +304,20 @@ export default function TaskManagement() {
                   value={form.title}
                   onChange={(e) => setForm({ ...form, title: e.target.value })}
                 />
+              </div>
+              <div>
+                <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Loai bieu mau</label>
+                <select
+                  className="w-full bg-surface-container-highest border-none rounded-lg focus:ring-2 focus:ring-surface-tint p-3 text-sm outline-none"
+                  value={form.template}
+                  onChange={(e) => setForm({ ...form, template: e.target.value })}
+                >
+                  {taskTemplates.map((template) => (
+                    <option key={template.value} value={template.value}>
+                      {template.label}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>

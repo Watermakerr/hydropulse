@@ -1,0 +1,2 @@
+ALTER TABLE task_reports
+  ADD COLUMN IF NOT EXISTS template TEXT;

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:hive_flutter/hive_flutter.dart';
 import 'screens/login_screen.dart';
+import 'services/gps_tracking_service.dart';
 
 void main() async {
   // Đảm bảo Flutter binding đã khởi tạo trước khi gọi Hive
@@ -13,6 +14,7 @@ void main() async {
   await Hive.openBox('lakes_box');
   await Hive.openBox('tasks_box');
   await Hive.openBox('offline_reports_box');
+  await GpsTrackingService.initialize();
   runApp(MyApp());
 }
 
