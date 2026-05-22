@@ -1,0 +1,2342 @@
+diff --git a/backend/src/app.js b/backend/src/app.js
+index 19bec2a..59f5007 100644
+--- a/backend/src/app.js
++++ b/backend/src/app.js
+@@ -17,6 +17,7 @@ const reportsRoutes = require('./routes/reports.routes');
+ const dashboardRoutes = require('./routes/dashboard.routes');
+ const notificationsRoutes = require('./routes/notifications.routes');
+ const satelliteRoutes = require('./routes/satellite.routes');
++const surveyPlansRoutes = require('./routes/surveyPlans.routes');
+ 
+ const app = express();
+ 
+@@ -37,6 +38,7 @@ app.use('/api/reports', reportsRoutes);
+ app.use('/api/dashboard', dashboardRoutes);
+ app.use('/api/notifications', notificationsRoutes);
+ app.use('/api/satellite', satelliteRoutes);
++app.use('/api/survey-plans', surveyPlansRoutes);
+ 
+ app.use(errorHandler);
+ 
+diff --git a/backend/src/config/env.js b/backend/src/config/env.js
+index 95b852d..1d4f7e7 100644
+--- a/backend/src/config/env.js
++++ b/backend/src/config/env.js
+@@ -15,5 +15,10 @@ module.exports = {
+   fcmServerKey: process.env.FCM_SERVER_KEY || '',
+   azureConnectionString: process.env.AZURE_STORAGE_CONNECTION_STRING || '',
+   azureContainer: process.env.AZURE_STORAGE_CONTAINER || 'report-photos',
+-  azureBlobReadSasMinutes: Number(process.env.AZURE_BLOB_READ_SAS_MINUTES || 60)
++  azureBlobReadSasMinutes: Number(process.env.AZURE_BLOB_READ_SAS_MINUTES || 60),
++  geeRunnerUrl: process.env.GEE_RUNNER_URL || '',
++  geeServiceAccountEmail: process.env.GEE_SERVICE_ACCOUNT_EMAIL || '',
++  geePrivateKey: process.env.GEE_PRIVATE_KEY || '',
++  geeWetMonths: process.env.GEE_WET_MONTHS || '6,7,8,9,10',
++  geeDryMonths: process.env.GEE_DRY_MONTHS || '11,12,1,2,3,4'
+ };
+diff --git a/backend/src/routes/dashboard.routes.js b/backend/src/routes/dashboard.routes.js
+index ec72ddc..3aff740 100644
+--- a/backend/src/routes/dashboard.routes.js
++++ b/backend/src/routes/dashboard.routes.js
+@@ -1,7 +1,9 @@
+ const express = require('express');
++const { param } = require('express-validator');
+ 
+ const pool = require('../db/pool');
+ const asyncHandler = require('../utils/asyncHandler');
++const validate = require('../middlewares/validate');
+ const { requireAuth, requireRole } = require('../middlewares/auth');
+ 
+ const router = express.Router();
+@@ -32,4 +34,69 @@ router.get(
+   })
+ );
+ 
++/**
++ * @swagger
++ * /api/dashboard/reservoir/{id}:
++ *   get:
++ *     tags: [Dashboard]
++ *     summary: Tổng quan tình trạng hồ
++ */
++router.get(
++  '/reservoir/:id',
++  requireAuth,
++  requireRole('admin'),
++  [param('id').isUUID()],
++  validate,
++  asyncHandler(async (req, res) => {
++    const { id } = req.params;
++
++    const base = await pool.query(
++      `SELECT r.id, r.name, r.area_ha, r.status,
++              (SELECT COUNT(*) FROM boundary_markers WHERE reservoir_id = r.id) AS markers_total,
++              (SELECT COUNT(*) FROM boundary_markers WHERE reservoir_id = r.id AND status <> 'normal') AS markers_warning,
++              (SELECT COUNT(*) FROM tasks WHERE reservoir_id = r.id) AS tasks_total,
++              (SELECT COUNT(*) FROM tasks WHERE reservoir_id = r.id AND status = 'pending') AS tasks_pending,
++              (SELECT COUNT(*) FROM tasks WHERE reservoir_id = r.id AND status = 'in_progress') AS tasks_in_progress,
++              (SELECT COUNT(*) FROM tasks WHERE reservoir_id = r.id AND status = 'completed') AS tasks_completed,
++              (SELECT COUNT(*) FROM survey_plans WHERE reservoir_id = r.id) AS plans_total
++       FROM reservoirs r
++       WHERE r.id = $1`,
++      [id]
++    );
++
++    if (!base.rowCount) {
++      return res.status(404).json({ success: false, message: 'Không tìm thấy hồ chứa' });
++    }
++
++    const latestScan = await pool.query(
++      `SELECT id, capture_date, water_surface_area, change_percentage, alert_level, season,
++              baseline_area_m2, delta_previous_percent, compare_mode, boundary_id
++       FROM satellite_analysis
++       WHERE reservoir_id = $1
++       ORDER BY capture_date DESC
++       LIMIT 1`,
++      [id]
++    );
++
++    const currentBoundary = await pool.query(
++      `SELECT id, season, area_m2, capture_date, source,
++              ST_AsGeoJSON(boundary)::json AS boundary_geojson
++       FROM shoreline_boundaries
++       WHERE reservoir_id = $1 AND is_current = TRUE
++       ORDER BY capture_date DESC NULLS LAST, created_at DESC
++       LIMIT 1`,
++      [id]
++    );
++
++    return res.json({
++      success: true,
++      data: {
++        ...base.rows[0],
++        latest_scan: latestScan.rows[0] || null,
++        current_boundary: currentBoundary.rows[0] || null
++      }
++    });
++  })
++);
++
+ module.exports = router;
+diff --git a/backend/src/routes/reservoirs.routes.js b/backend/src/routes/reservoirs.routes.js
+index 5155625..2f017e9 100644
+--- a/backend/src/routes/reservoirs.routes.js
++++ b/backend/src/routes/reservoirs.routes.js
+@@ -6,10 +6,14 @@ const pool = require('../db/pool');
+ const validate = require('../middlewares/validate');
+ const asyncHandler = require('../utils/asyncHandler');
+ const { requireAuth, requireRole } = require('../middlewares/auth');
++const { parseMonthList, determineSeason } = require('../utils/season');
+ 
+ const router = express.Router();
+ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+ 
++const DEFAULT_WET_MONTHS = [6, 7, 8, 9, 10];
++const DEFAULT_DRY_MONTHS = [11, 12, 1, 2, 3, 4];
++
+ function normalizeGeoJsonToPolygon(geojson) {
+   if (!geojson) {
+     return null;
+@@ -52,6 +56,29 @@ function extractBoundaryInput(req) {
+   return JSON.stringify(normalizeGeoJsonToPolygon(req.body.boundaryGeoJSON));
+ }
+ 
++function parseBoundaryGeoJson(value) {
++  if (value === undefined || value === null || value === '') {
++    return null;
++  }
++
++  if (typeof value === 'string') {
++    const parsed = JSON.parse(value);
++    return normalizeGeoJsonToPolygon(parsed);
++  }
++
++  return normalizeGeoJsonToPolygon(value);
++}
++
++function resolveSeason(explicitSeason, captureDate) {
++  if (explicitSeason) {
++    return explicitSeason;
++  }
++
++  const wetMonths = parseMonthList(process.env.GEE_WET_MONTHS, DEFAULT_WET_MONTHS);
++  const dryMonths = parseMonthList(process.env.GEE_DRY_MONTHS, DEFAULT_DRY_MONTHS);
++  return determineSeason(captureDate, wetMonths, dryMonths);
++}
++
+ /**
+  * @swagger
+  * tags:
+@@ -413,4 +440,186 @@ router.delete(
+   })
+ );
+ 
++/**
++ * @swagger
++ * /api/reservoirs/{id}/shorelines:
++ *   get:
++ *     tags: [Reservoirs]
++ *     summary: Danh sách ranh giới theo mùa
++ */
++router.get(
++  '/:id/shorelines',
++  requireAuth,
++  [
++    param('id').isUUID(),
++    query('season').optional().isIn(['dry', 'wet', 'normal', 'transition', 'unknown']),
++    query('type').optional().isIn(['baseline', 'scan', 'survey']),
++    query('current').optional().isBoolean()
++  ],
++  validate,
++  asyncHandler(async (req, res) => {
++    const conditions = ['reservoir_id = $1'];
++    const values = [req.params.id];
++
++    if (req.query.season) {
++      values.push(req.query.season);
++      conditions.push(`season = $${values.length}`);
++    }
++
++    if (req.query.type) {
++      values.push(req.query.type);
++      conditions.push(`boundary_type = $${values.length}`);
++    }
++
++    if (req.query.current !== undefined) {
++      values.push(req.query.current === 'true');
++      conditions.push(`is_current = $${values.length}`);
++    }
++
++    const result = await pool.query(
++      `SELECT id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current, metadata,
++              ST_AsGeoJSON(boundary)::json AS boundary_geojson, created_at
++       FROM shoreline_boundaries
++       WHERE ${conditions.join(' AND ')}
++       ORDER BY capture_date DESC NULLS LAST, created_at DESC`,
++      values
++    );
++
++    return res.json({ success: true, data: result.rows });
++  })
++);
++
++/**
++ * @swagger
++ * /api/reservoirs/{id}/shorelines:
++ *   post:
++ *     tags: [Reservoirs]
++ *     summary: Tạo hoặc cập nhật ranh giới theo mùa
++ */
++router.post(
++  '/:id/shorelines',
++  requireAuth,
++  requireRole('admin'),
++  [
++    param('id').isUUID(),
++    body('boundaryGeoJSON').exists(),
++    body('boundaryType').optional().isIn(['baseline', 'scan', 'survey']),
++    body('season').optional().isIn(['dry', 'wet', 'normal', 'transition', 'unknown']),
++    body('source').optional().isIn(['gee', 'planet', 'manual', 'survey', 'import']),
++    body('captureDate').optional().isISO8601(),
++    body('isCurrent').optional().isBoolean(),
++    body('metadata').optional()
++  ],
++  validate,
++  asyncHandler(async (req, res) => {
++    const boundaryType = req.body.boundaryType || 'scan';
++    const captureDate = req.body.captureDate || null;
++    const season = resolveSeason(req.body.season, captureDate);
++    const source = req.body.source || 'manual';
++    const isCurrent = req.body.isCurrent !== undefined ? req.body.isCurrent : boundaryType === 'scan';
++    const metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata || null;
++
++    const boundary = parseBoundaryGeoJson(req.body.boundaryGeoJSON);
++    if (!boundary) {
++      return res.status(400).json({ success: false, message: 'Thiếu dữ liệu boundaryGeoJSON' });
++    }
++
++    const boundaryString = JSON.stringify(boundary);
++    const client = await pool.connect();
++
++    try {
++      await client.query('BEGIN');
++
++      if (boundaryType === 'baseline') {
++        await client.query(
++          `DELETE FROM shoreline_boundaries
++           WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2`,
++          [req.params.id, season]
++        );
++      }
++
++      if (isCurrent) {
++        await client.query(
++          `UPDATE shoreline_boundaries
++           SET is_current = FALSE
++           WHERE reservoir_id = $1 AND boundary_type = 'scan' AND is_current = TRUE`,
++          [req.params.id]
++        );
++      }
++
++      const result = await client.query(
++        `INSERT INTO shoreline_boundaries
++          (reservoir_id, boundary_type, season, source, capture_date, area_m2, boundary, is_current, metadata)
++         VALUES
++          ($1, $2, $3, $4, $5,
++           ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($6),4326)::geography),
++           ST_SetSRID(ST_GeomFromGeoJSON($6),4326),
++           $7, $8)
++         RETURNING id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current,
++                   ST_AsGeoJSON(boundary)::json AS boundary_geojson, created_at`,
++        [
++          req.params.id,
++          boundaryType,
++          season,
++          source,
++          captureDate,
++          boundaryString,
++          isCurrent,
++          metadata
++        ]
++      );
++
++      await client.query('COMMIT');
++      return res.status(201).json({ success: true, data: result.rows[0] });
++    } catch (error) {
++      await client.query('ROLLBACK');
++      throw error;
++    } finally {
++      client.release();
++    }
++  })
++);
++
++/**
++ * @swagger
++ * /api/reservoirs/{id}/shorelines/flood-expansion:
++ *   get:
++ *     tags: [Reservoirs]
++ *     summary: Vùng ngập mở rộng (mưa - khô)
++ */
++router.get(
++  '/:id/shorelines/flood-expansion',
++  requireAuth,
++  [param('id').isUUID()],
++  validate,
++  asyncHandler(async (req, res) => {
++    const result = await pool.query(
++      `WITH wet AS (
++         SELECT boundary
++         FROM shoreline_boundaries
++         WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = 'wet'
++         ORDER BY created_at DESC
++         LIMIT 1
++       ),
++       dry AS (
++         SELECT boundary
++         FROM shoreline_boundaries
++         WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = 'dry'
++         ORDER BY created_at DESC
++         LIMIT 1
++       )
++       SELECT ST_AsGeoJSON(ST_Difference(wet.boundary, dry.boundary))::json AS boundary_geojson,
++              ST_Area(ST_Difference(wet.boundary, dry.boundary)::geography) AS area_m2
++       FROM wet, dry`,
++      [req.params.id]
++    );
++
++    if (!result.rowCount || !result.rows[0].boundary_geojson) {
++      return res.status(404).json({ success: false, message: 'Thiếu ranh giới baseline mùa mưa/khô' });
++    }
++
++    return res.json({ success: true, data: result.rows[0] });
++  })
++);
++
+ module.exports = router;
+diff --git a/backend/src/routes/satellite.routes.js b/backend/src/routes/satellite.routes.js
+index b1444bd..621d748 100644
+--- a/backend/src/routes/satellite.routes.js
++++ b/backend/src/routes/satellite.routes.js
+@@ -1,4 +1,6 @@
+ const express = require('express');
++const { body } = require('express-validator');
++const validate = require('../middlewares/validate');
+ const router = express.Router();
+ const satelliteService = require('../services/satelliteService');
+ const pool = require('../db/pool');
+@@ -11,18 +13,25 @@ const { requireAuth, requireRole } = require('../middlewares/auth');
+  *     summary: Trigger satellite analysis for a specific reservoir
+  *     tags: [Satellite]
+  */
+-router.post('/analyze/:reservoirId', requireAuth, requireRole('admin'), async (req, res, next) => {
++router.post(
++  '/analyze/:reservoirId',
++  requireAuth,
++  requireRole('admin'),
++  [body('mode').optional().isIn(['auto', 'gee', 'planet'])],
++  validate,
++  async (req, res, next) => {
+   try {
+     const { reservoirId } = req.params;
+-    const { date } = req.body;
++    const { date, mode } = req.body;
+     const dateStr = date || new Date().toISOString().split('T')[0];
+ 
+-    const result = await satelliteService.analyzeReservoir(reservoirId, dateStr);
++    const result = await satelliteService.analyzeReservoir(reservoirId, dateStr, mode || 'auto');
+     res.json({ success: true, data: result });
+   } catch (error) {
+     next(error);
+   }
+-});
++  }
++);
+ 
+ /**
+  * @swagger
+@@ -31,14 +40,22 @@ router.post('/analyze/:reservoirId', requireAuth, requireRole('admin'), async (r
+  *     summary: Trigger satellite analysis for all active reservoirs
+  *     tags: [Satellite]
+  */
+-router.post('/analyze-all', requireAuth, requireRole('admin'), async (req, res, next) => {
++router.post(
++  '/analyze-all',
++  requireAuth,
++  requireRole('admin'),
++  [body('mode').optional().isIn(['auto', 'gee', 'planet'])],
++  validate,
++  async (req, res, next) => {
+   try {
+-    const results = await satelliteService.analyzeAllReservoirs();
++    const { mode } = req.body || {};
++    const results = await satelliteService.analyzeAllReservoirs(mode || 'auto');
+     res.json({ success: true, data: { total: results.length, results } });
+   } catch (error) {
+     next(error);
+   }
+-});
++  }
++);
+ 
+ /**
+  * @swagger
+@@ -51,7 +68,8 @@ router.get('/history/:reservoirId', requireAuth, async (req, res, next) => {
+   try {
+     const { reservoirId } = req.params;
+     const result = await pool.query(
+-      `SELECT id, capture_date, water_surface_area, change_percentage, alert_level, raw_response, created_at
++      `SELECT id, capture_date, water_surface_area, change_percentage, alert_level, raw_response, created_at,
++              season, baseline_area_m2, delta_previous_percent, compare_mode, boundary_id
+        FROM satellite_analysis
+        WHERE reservoir_id = $1
+        ORDER BY capture_date DESC
+diff --git a/backend/src/routes/tasks.routes.js b/backend/src/routes/tasks.routes.js
+index 2c97b43..1a2aabb 100644
+--- a/backend/src/routes/tasks.routes.js
++++ b/backend/src/routes/tasks.routes.js
+@@ -34,6 +34,17 @@ async function markerBelongsToReservoir(markerId, reservoirId) {
+   return result.rowCount > 0;
+ }
+ 
++async function planBelongsToReservoir(planId, reservoirId) {
++  const result = await pool.query(
++    `SELECT id
++     FROM survey_plans
++     WHERE id = $1 AND reservoir_id = $2`,
++    [planId, reservoirId]
++  );
++
++  return result.rowCount > 0;
++}
++
+ /**
+  * @swagger
+  * tags:
+@@ -75,7 +86,8 @@ router.get(
+   [
+     query('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
+     query('assignedTo').optional().isUUID(),
+-    query('reservoirId').optional().isUUID()
++    query('reservoirId').optional().isUUID(),
++    query('planId').optional().isUUID()
+   ],
+   validate,
+   asyncHandler(async (req, res) => {
+@@ -97,19 +109,25 @@ router.get(
+       conditions.push(`t.reservoir_id = $${values.length}`);
+     }
+ 
++    if (req.query.planId) {
++      values.push(req.query.planId);
++      conditions.push(`t.plan_id = $${values.length}`);
++    }
++
+     if (req.user.role === 'worker') {
+       values.push(req.user.sub);
+       conditions.push(`t.assigned_to = $${values.length}`);
+     }
+ 
+     const result = await pool.query(
+-          `SELECT t.*, r.name AS reservoir_name, m.code AS marker_code,
+-            CASE WHEN m.location IS NULL THEN NULL ELSE ST_AsGeoJSON(m.location)::json END AS marker_location_geojson,
+-            u.full_name AS assigned_to_name
++      `SELECT t.*, r.name AS reservoir_name, m.code AS marker_code,
++              CASE WHEN m.location IS NULL THEN NULL ELSE ST_AsGeoJSON(m.location)::json END AS marker_location_geojson,
++              u.full_name AS assigned_to_name, sp.title AS plan_title
+        FROM tasks t
+        JOIN reservoirs r ON r.id = t.reservoir_id
+        LEFT JOIN boundary_markers m ON m.id = t.marker_id
+        LEFT JOIN users u ON u.id = t.assigned_to
++       LEFT JOIN survey_plans sp ON sp.id = t.plan_id
+        WHERE ${conditions.join(' AND ')}
+        ORDER BY t.created_at DESC`,
+       values
+@@ -147,6 +165,7 @@ router.post(
+     body('reservoirId').isUUID(),
+     body('markerId').optional().isUUID(),
+     body('assignedTo').optional().isUUID(),
++    body('planId').optional().isUUID(),
+     body('title').isString().isLength({ min: 3 }),
+     body('template').optional().isString().isLength({ min: 2, max: 100 }),
+     body('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
+@@ -158,6 +177,7 @@ router.post(
+       reservoirId,
+       markerId,
+       assignedTo,
++      planId,
+       title,
+       description,
+       template,
+@@ -180,15 +200,23 @@ router.post(
+       }
+     }
+ 
++    if (planId) {
++      const planValid = await planBelongsToReservoir(planId, reservoirId);
++      if (!planValid) {
++        return res.status(400).json({ success: false, message: 'planId không thuộc reservoirId đã chọn' });
++      }
++    }
++
+     const result = await pool.query(
+-      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, title, description, template, status, priority, due_date)
+-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
++      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, plan_id, title, description, template, status, priority, due_date)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        RETURNING *`,
+       [
+         reservoirId,
+         markerId || null,
+         assignedTo || null,
+         req.user.sub,
++        planId || null,
+         title,
+         description || null,
+         template || null,
+@@ -242,15 +270,17 @@ router.patch(
+     body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
+     body('assignedTo').optional({ nullable: true }).isUUID(),
+     body('markerId').optional({ nullable: true }).isUUID(),
+-    body('dueDate').optional({ nullable: true }).isISO8601()
++    body('dueDate').optional({ nullable: true }).isISO8601(),
++    body('planId').optional({ nullable: true }).isUUID()
+   ],
+   validate,
+   asyncHandler(async (req, res) => {
+     const { id } = req.params;
+-    const { title, description, template, status, priority, assignedTo, markerId, dueDate } = req.body;
++    const { title, description, template, status, priority, assignedTo, markerId, dueDate, planId } = req.body;
+     const hasAssignedTo = Object.prototype.hasOwnProperty.call(req.body, 'assignedTo');
+     const hasMarkerId = Object.prototype.hasOwnProperty.call(req.body, 'markerId');
+     const hasDueDate = Object.prototype.hasOwnProperty.call(req.body, 'dueDate');
++    const hasPlanId = Object.prototype.hasOwnProperty.call(req.body, 'planId');
+ 
+     const oldTask = await pool.query('SELECT assigned_to, title, reservoir_id FROM tasks WHERE id = $1', [id]);
+     if (!oldTask.rowCount) {
+@@ -271,6 +301,13 @@ router.patch(
+       }
+     }
+ 
++    if (hasPlanId && planId !== null) {
++      const planValid = await planBelongsToReservoir(planId, oldTask.rows[0].reservoir_id);
++      if (!planValid) {
++        return res.status(400).json({ success: false, message: 'planId không thuộc reservoir của task' });
++      }
++    }
++
+     const result = await pool.query(
+       `UPDATE tasks
+        SET title = COALESCE($1, title),
+@@ -280,8 +317,9 @@ router.patch(
+            priority = COALESCE($5, priority),
+            assigned_to = CASE WHEN $6::boolean THEN $7::uuid ELSE assigned_to END,
+            marker_id = CASE WHEN $8::boolean THEN $9::uuid ELSE marker_id END,
+-           due_date = CASE WHEN $10::boolean THEN $11::date ELSE due_date END
+-       WHERE id = $12
++           due_date = CASE WHEN $10::boolean THEN $11::date ELSE due_date END,
++           plan_id = CASE WHEN $12::boolean THEN $13::uuid ELSE plan_id END
++       WHERE id = $14
+        RETURNING *`,
+       [
+         title || null,
+@@ -295,6 +333,8 @@ router.patch(
+         markerId ?? null,
+         hasDueDate,
+         dueDate ?? null,
++        hasPlanId,
++        planId ?? null,
+         id
+       ]
+     );
+diff --git a/backend/src/scripts/dbInit.js b/backend/src/scripts/dbInit.js
+index 4c53eca..12549d3 100644
+--- a/backend/src/scripts/dbInit.js
++++ b/backend/src/scripts/dbInit.js
+@@ -18,6 +18,16 @@ async function main() {
+     await runSqlFile('002_add_supporting_indexes.sql');
+   }
+ 
++  const migration3 = path.join(__dirname, '../../sql/003_satellite_analysis.sql');
++  if (fs.existsSync(migration3)) {
++    await runSqlFile('003_satellite_analysis.sql');
++  }
++
++  const migration4 = path.join(__dirname, '../../sql/004_shoreline_survey.sql');
++  if (fs.existsSync(migration4)) {
++    await runSqlFile('004_shoreline_survey.sql');
++  }
++
+   await pool.end();
+   console.log('Database initialization completed');
+ }
+diff --git a/backend/src/services/satelliteService.js b/backend/src/services/satelliteService.js
+index a31080b..5ec5e51 100644
+--- a/backend/src/services/satelliteService.js
++++ b/backend/src/services/satelliteService.js
+@@ -1,5 +1,17 @@
+ const axios = require('axios');
+ const pool = require('../db/pool');
++const { runGeeScan } = require('./geeService');
++const { parseMonthList, determineSeason } = require('../utils/season');
++
++const DEFAULT_WET_MONTHS = [6, 7, 8, 9, 10];
++const DEFAULT_DRY_MONTHS = [11, 12, 1, 2, 3, 4];
++
++function getSeasonSets() {
++  return {
++    wetMonths: parseMonthList(process.env.GEE_WET_MONTHS, DEFAULT_WET_MONTHS),
++    dryMonths: parseMonthList(process.env.GEE_DRY_MONTHS, DEFAULT_DRY_MONTHS)
++  };
++}
+ 
+ /**
+  * SatelliteService — Uses Planet Data API (api.planet.com) with API Key
+@@ -89,16 +101,188 @@ class SatelliteService {
+     }
+   }
+ 
++  async getBaselineBoundary(reservoirId, season) {
++    const result = await pool.query(
++      `SELECT id, area_m2
++       FROM shoreline_boundaries
++       WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2
++       ORDER BY created_at DESC
++       LIMIT 1`,
++      [reservoirId, season]
++    );
++
++    if (result.rows.length) {
++      return result.rows[0];
++    }
++
++    const fallback = await pool.query(
++      `SELECT id, area_m2
++       FROM shoreline_boundaries
++       WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = 'normal'
++       ORDER BY created_at DESC
++       LIMIT 1`,
++      [reservoirId]
++    );
++
++    return fallback.rows[0] || null;
++  }
++
++  async createShorelineBoundary({
++    reservoirId,
++    boundaryGeoJSON,
++    season,
++    source,
++    captureDate,
++    boundaryType = 'scan',
++    metadata = null,
++    isCurrent = true
++  }) {
++    const client = await pool.connect();
++    const boundaryString = JSON.stringify(boundaryGeoJSON);
++
++    try {
++      await client.query('BEGIN');
++
++      if (boundaryType === 'baseline') {
++        await client.query(
++          `DELETE FROM shoreline_boundaries
++           WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2`,
++          [reservoirId, season]
++        );
++      }
++
++      if (isCurrent) {
++        await client.query(
++          `UPDATE shoreline_boundaries
++           SET is_current = FALSE
++           WHERE reservoir_id = $1 AND boundary_type = 'scan' AND is_current = TRUE`,
++          [reservoirId]
++        );
++      }
++
++      const result = await client.query(
++        `INSERT INTO shoreline_boundaries
++          (reservoir_id, boundary_type, season, source, capture_date, area_m2, boundary, is_current, metadata)
++         VALUES
++          ($1, $2, $3, $4, $5,
++           ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($6),4326)::geography),
++           ST_SetSRID(ST_GeomFromGeoJSON($6),4326),
++           $7, $8)
++         RETURNING id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current,
++                   ST_AsGeoJSON(boundary)::json AS boundary_geojson`,
++        [
++          reservoirId,
++          boundaryType,
++          season,
++          source,
++          captureDate || null,
++          boundaryString,
++          isCurrent,
++          metadata
++        ]
++      );
++
++      await client.query('COMMIT');
++      return result.rows[0];
++    } catch (error) {
++      await client.query('ROLLBACK');
++      throw error;
++    } finally {
++      client.release();
++    }
++  }
++
+   /**
+    * Analyze a reservoir using Planet Data API
+    * Searches for recent Sentinel-2 scenes and extracts metadata
+    */
+-  async analyzeReservoir(reservoirId, date) {
++  async analyzeReservoir(reservoirId, date, mode = 'auto') {
++    const useGee = mode === 'gee' || (mode !== 'planet' && Boolean(process.env.GEE_RUNNER_URL));
++    if (useGee) {
++      return this.analyzeReservoirWithGee(reservoirId, date);
++    }
++    return this.analyzeReservoirWithPlanet(reservoirId, date);
++  }
++
++  async analyzeReservoirWithGee(reservoirId, date) {
++    const reservoir = await this.getReservoirGeoJSON(reservoirId);
++    if (!reservoir.geojson_boundary) {
++      throw new Error('Reservoir has no boundary geometry');
++    }
++
++    const dateTo = date || new Date().toISOString().split('T')[0];
++    const { wetMonths, dryMonths } = getSeasonSets();
++
++    const payload = {
++      reservoir: {
++        id: reservoir.id,
++        name: reservoir.name,
++        area_ha: reservoir.area_ha
++      },
++      boundary_geojson: reservoir.geojson_boundary,
++      date: dateTo,
++      season_config: {
++        wet_months: Array.from(wetMonths),
++        dry_months: Array.from(dryMonths)
++      }
++    };
++
++    const geeResult = await runGeeScan(payload);
++    if (!geeResult || !geeResult.boundary_geojson) {
++      throw new Error('GEE scan did not return boundary_geojson');
++    }
++
++    const captureDate = geeResult.capture_date || dateTo;
++    const season = geeResult.season || determineSeason(captureDate, wetMonths, dryMonths);
++
++    const boundaryRow = await this.createShorelineBoundary({
++      reservoirId,
++      boundaryGeoJSON: geeResult.boundary_geojson,
++      season,
++      source: 'gee',
++      captureDate,
++      boundaryType: 'scan',
++      metadata: geeResult.metadata || null,
++      isCurrent: true
++    });
++
++    const baseline = await this.getBaselineBoundary(reservoirId, season);
++    const baselineArea = baseline?.area_m2 || null;
++    const compareMode = baselineArea ? 'seasonal' : 'previous';
++    const waterArea = geeResult.water_surface_area || boundaryRow.area_m2 || 0;
++
++    const analysisResult = await this.saveAnalysis({
++      reservoirId,
++      date: captureDate,
++      area: waterArea,
++      rawResponse: geeResult.metadata || { source: 'gee' },
++      season,
++      boundaryId: boundaryRow.id,
++      baselineBoundaryId: baseline?.id || null,
++      baselineArea,
++      compareMode
++    });
++
++    return {
++      reservoirId,
++      reservoirName: reservoir.name,
++      date: captureDate,
++      season,
++      boundaryId: boundaryRow.id,
++      estimatedWaterAreaM2: waterArea,
++      estimatedWaterAreaHa: (waterArea / 10000).toFixed(2),
++      changePercentage: analysisResult.changePercentage,
++      deltaPreviousPercent: analysisResult.deltaPreviousPercent,
++      alertLevel: analysisResult.alertLevel,
++      status: 'SUCCESS'
++    };
++  }
++
++  async analyzeReservoirWithPlanet(reservoirId, date) {
+     if (!this.apiKey) {
+       throw new Error('PLANET_API_KEY is required');
+     }
+ 
+-    // 1. Get reservoir geometry from DB
+     const reservoir = await this.getReservoirGeoJSON(reservoirId);
+     console.log(`  Reservoir: ${reservoir.name}, Area: ${reservoir.area_ha} ha`);
+ 
+@@ -106,7 +290,6 @@ class SatelliteService {
+       throw new Error('Reservoir has no boundary geometry');
+     }
+ 
+-    // 2. Search for scenes in the last 30 days up to the target date
+     const dateTo = date || new Date().toISOString().split('T')[0];
+     const dateFromObj = new Date(dateTo);
+     dateFromObj.setDate(dateFromObj.getDate() - 30);
+@@ -125,16 +308,13 @@ class SatelliteService {
+       };
+     }
+ 
+-    // 3. Pick the most recent, clearest scene
+     const bestScene = scenes.sort((a, b) => {
+-      // Sort by cloud cover (ascending), then by date (descending)
+       const cloudDiff = a.properties.cloud_cover - b.properties.cloud_cover;
+       if (Math.abs(cloudDiff) > 0.05) return cloudDiff;
+-      
++
+       const dateDiff = new Date(b.properties.acquired).getTime() - new Date(a.properties.acquired).getTime();
+       if (dateDiff !== 0) return dateDiff;
+-      
+-      // Final tie-breaker: deterministic ID sort
++
+       return b.id.localeCompare(a.id);
+     })[0];
+ 
+@@ -143,40 +323,44 @@ class SatelliteService {
+     const cloudCover = sceneProps.cloud_cover;
+     const clearPercent = (1 - cloudCover) * 100;
+ 
+-    // 4. Estimate visible water area
+-    // Using reservoir boundary area and clear sky percentage
+-    const reservoirAreaM2 = reservoir.area_ha * 10000; // ha -> m2
++    const reservoirAreaM2 = reservoir.area_ha * 10000;
+     const estimatedWaterArea = reservoirAreaM2 * (1 - cloudCover);
+ 
+-    console.log(`  Best scene: ${bestScene.id}`);
+-    console.log(`  Captured: ${captureDate}, Cloud: ${(cloudCover * 100).toFixed(1)}%`);
+-    console.log(`  Clear sky: ${clearPercent.toFixed(1)}%`);
+-    console.log(`  Estimated visible water area: ${estimatedWaterArea.toFixed(0)} m²`);
++    const { wetMonths, dryMonths } = getSeasonSets();
++    const season = determineSeason(captureDate, wetMonths, dryMonths);
++    const baseline = await this.getBaselineBoundary(reservoirId, season);
++    const baselineArea = baseline?.area_m2 || null;
+ 
+-    // 5. Save to database and check for alerts
+-    const analysisResult = await this.saveAnalysis(
++    const analysisResult = await this.saveAnalysis({
+       reservoirId,
+-      captureDate,
+-      estimatedWaterArea,
+-      {
++      date: captureDate,
++      area: estimatedWaterArea,
++      rawResponse: {
+         scene_id: bestScene.id,
+         cloud_cover: cloudCover,
+         clear_percent: clearPercent,
+         acquired: sceneProps.acquired,
+         pixel_resolution: sceneProps.pixel_resolution || 10,
+         scenes_found: scenes.length
+-      }
+-    );
++      },
++      season,
++      boundaryId: null,
++      baselineBoundaryId: baseline?.id || null,
++      baselineArea,
++      compareMode: baselineArea ? 'seasonal' : 'previous'
++    });
+ 
+     return {
+       reservoirId,
+       reservoirName: reservoir.name,
+       date: captureDate,
+       sceneId: bestScene.id,
++      season,
+       cloudCover: `${(cloudCover * 100).toFixed(1)}%`,
+       estimatedWaterAreaM2: estimatedWaterArea,
+       estimatedWaterAreaHa: (estimatedWaterArea / 10000).toFixed(2),
+       changePercentage: analysisResult.changePercentage,
++      deltaPreviousPercent: analysisResult.deltaPreviousPercent,
+       alertLevel: analysisResult.alertLevel,
+       scenesFound: scenes.length,
+       status: 'SUCCESS'
+@@ -186,36 +370,76 @@ class SatelliteService {
+   /**
+    * Save analysis result and calculate change alerts
+    */
+-  async saveAnalysis(reservoirId, date, area, rawResponse) {
+-    // Get previous record for change calculation (must be before current analysis date)
++  async saveAnalysis({
++    reservoirId,
++    date,
++    area,
++    rawResponse,
++    season,
++    boundaryId,
++    baselineBoundaryId,
++    baselineArea,
++    compareMode
++  }) {
+     const prevRecord = await pool.query(
+       'SELECT water_surface_area FROM satellite_analysis WHERE reservoir_id = $1 AND capture_date < $2 ORDER BY capture_date DESC LIMIT 1',
+       [reservoirId, date]
+     );
+ 
+-    let changePercentage = 0;
+-    let alertLevel = 'LOW';
+-
++    let deltaPreviousPercent = 0;
+     if (prevRecord.rows.length > 0 && prevRecord.rows[0].water_surface_area > 0) {
+       const prevArea = prevRecord.rows[0].water_surface_area;
+-      changePercentage = ((area - prevArea) / prevArea) * 100;
++      deltaPreviousPercent = ((area - prevArea) / prevArea) * 100;
++    }
+ 
+-      if (Math.abs(changePercentage) > 10) alertLevel = 'HIGH';
+-      else if (Math.abs(changePercentage) > 5) alertLevel = 'MEDIUM';
++    let changePercentage = 0;
++    let finalCompareMode = compareMode || 'seasonal';
++
++    if (baselineArea && baselineArea > 0) {
++      changePercentage = ((area - baselineArea) / baselineArea) * 100;
++    } else if (prevRecord.rows.length > 0 && prevRecord.rows[0].water_surface_area > 0) {
++      changePercentage = deltaPreviousPercent;
++      finalCompareMode = 'previous';
++    } else {
++      finalCompareMode = 'none';
+     }
+ 
++    let alertLevel = 'LOW';
++    if (Math.abs(changePercentage) > 10) alertLevel = 'HIGH';
++    else if (Math.abs(changePercentage) > 5) alertLevel = 'MEDIUM';
++
+     await pool.query(
+-      `INSERT INTO satellite_analysis (reservoir_id, capture_date, water_surface_area, change_percentage, alert_level, raw_response)
+-       VALUES ($1, $2, $3, $4, $5, $6)
++      `INSERT INTO satellite_analysis
++        (reservoir_id, capture_date, water_surface_area, change_percentage, alert_level, raw_response,
++         season, boundary_id, baseline_boundary_id, baseline_area_m2, delta_previous_percent, compare_mode)
++       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        ON CONFLICT (reservoir_id, capture_date) DO UPDATE SET
+          water_surface_area = EXCLUDED.water_surface_area,
+          change_percentage = EXCLUDED.change_percentage,
+          alert_level = EXCLUDED.alert_level,
+-         raw_response = EXCLUDED.raw_response`,
+-      [reservoirId, date, area, changePercentage, alertLevel, rawResponse]
++         raw_response = EXCLUDED.raw_response,
++         season = EXCLUDED.season,
++         boundary_id = EXCLUDED.boundary_id,
++         baseline_boundary_id = EXCLUDED.baseline_boundary_id,
++         baseline_area_m2 = EXCLUDED.baseline_area_m2,
++         delta_previous_percent = EXCLUDED.delta_previous_percent,
++         compare_mode = EXCLUDED.compare_mode`,
++      [
++        reservoirId,
++        date,
++        area,
++        changePercentage,
++        alertLevel,
++        rawResponse,
++        season,
++        boundaryId,
++        baselineBoundaryId,
++        baselineArea,
++        deltaPreviousPercent,
++        finalCompareMode
++      ]
+     );
+ 
+-    // If alert is HIGH, create a notification for admin
+     if (alertLevel === 'HIGH') {
+       await pool.query(
+         `INSERT INTO notifications (user_id, title, message)
+@@ -225,13 +449,13 @@ class SatelliteService {
+       );
+     }
+ 
+-    return { changePercentage, alertLevel };
++    return { changePercentage, deltaPreviousPercent, alertLevel };
+   }
+ 
+   /**
+    * Analyze ALL active reservoirs — for daily cron job
+    */
+-  async analyzeAllReservoirs() {
++  async analyzeAllReservoirs(mode = 'auto') {
+     const today = new Date().toISOString().split('T')[0];
+     const reservoirs = await pool.query(
+       "SELECT id FROM reservoirs WHERE status = 'active' AND boundary IS NOT NULL"
+@@ -242,7 +466,7 @@ class SatelliteService {
+ 
+     for (const row of reservoirs.rows) {
+       try {
+-        const result = await this.analyzeReservoir(row.id, today);
++        const result = await this.analyzeReservoir(row.id, today, mode);
+         results.push(result);
+       } catch (error) {
+         console.error(`Failed to analyze reservoir ${row.id}:`, error.message);
+diff --git a/frontend/src/pages/Dashboard.tsx b/frontend/src/pages/Dashboard.tsx
+index d2acfd1..f427487 100644
+--- a/frontend/src/pages/Dashboard.tsx
++++ b/frontend/src/pages/Dashboard.tsx
+@@ -1,6 +1,6 @@
+ import { Waves, HardHat, Flag, BadgeCheck, Download, Filter, MoreVertical, Maximize } from 'lucide-react';
+ import { useState, useEffect } from 'react';
+-import { api, DashboardSummary, SystemLog, Reservoir, Task } from '../services/api';
++import { api, DashboardSummary, SystemLog, Reservoir, Task, ReservoirOverview } from '../services/api';
+ import { Link, useNavigate } from 'react-router-dom';
+ 
+ type ReservoirBackendStatus = 'active' | 'inactive' | 'under_review';
+@@ -28,11 +28,14 @@ export default function Dashboard() {
+   const [summary, setSummary] = useState<DashboardSummary | null>(null);
+   const [logs, setLogs] = useState<SystemLog[]>([]);
+   const [reservoirs, setReservoirs] = useState<Reservoir[]>([]);
++  const [hoaBinhOverview, setHoaBinhOverview] = useState<ReservoirOverview | null>(null);
+   const [search, setSearch] = useState('');
+   const [statusFilter, setStatusFilter] = useState<'all' | ReservoirBackendStatus>('all');
+   const [urgentTasksCount, setUrgentTasksCount] = useState(0);
+   const [loading, setLoading] = useState(true);
+ 
++  const normalizeText = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
++
+   useEffect(() => {
+     const fetchData = async () => {
+       try {
+@@ -45,6 +48,14 @@ export default function Dashboard() {
+         setSummary(summaryData);
+         setLogs(logsData.slice(0, 3)); // Only show top 3 logs
+         setReservoirs(reservoirsData.slice(0, 4)); // Only show top 4 reservoirs
++
++        const hoaBinh = reservoirsData.find((r) => normalizeText(r.name).includes('hoa binh'));
++        if (hoaBinh) {
++          const overview = await api.getReservoirOverview(hoaBinh.id);
++          setHoaBinhOverview(overview);
++        } else {
++          setHoaBinhOverview(null);
++        }
+         
+         const urgentCount = allTasks.filter(t => t.priority === 'urgent' && (t.status === 'pending' || t.status === 'in_progress')).length;
+         setUrgentTasksCount(urgentCount);
+@@ -96,6 +107,15 @@ export default function Dashboard() {
+     URL.revokeObjectURL(url);
+   };
+ 
++  const overviewScan = hoaBinhOverview?.latest_scan || null;
++  const currentAreaM2 = hoaBinhOverview?.current_boundary?.area_m2 || overviewScan?.water_surface_area || null;
++  const changePercent = overviewScan?.change_percentage ?? null;
++  const compareLabel = overviewScan?.compare_mode === 'seasonal'
++    ? 'So với baseline mùa'
++    : overviewScan?.compare_mode === 'previous'
++      ? 'So với lần trước'
++      : 'Chưa có baseline';
++
+   return (
+     <div className="space-y-10">
+       <header className="flex justify-between items-end">
+@@ -171,6 +191,58 @@ export default function Dashboard() {
+         </div>
+       </div>
+ 
++      {hoaBinhOverview && (
++        <section className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_24px_24px_rgba(0,51,88,0.03)]">
++          <div className="flex items-center justify-between mb-6">
++            <div>
++              <h3 className="text-xl font-black text-primary">Tổng quan hồ Hòa Bình</h3>
++              <p className="text-[11px] text-on-surface-variant mt-1">Cập nhật theo lần quét vệ tinh gần nhất</p>
++            </div>
++            <button
++              onClick={() => navigate('/reservoirs')}
++              className="text-xs font-bold text-primary hover:text-primary/80"
++            >
++              Xem chi tiết
++            </button>
++          </div>
++          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
++            <div className="bg-white rounded-xl p-4 border border-slate-100">
++              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Diện tích hiện tại</p>
++              <p className="text-2xl font-black text-primary mt-2">
++                {currentAreaM2 ? `${(currentAreaM2 / 10000).toFixed(2)} ha` : 'N/A'}
++              </p>
++              <p className="text-[10px] text-on-surface-variant mt-1">{compareLabel}</p>
++            </div>
++            <div className="bg-white rounded-xl p-4 border border-slate-100">
++              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Biến động</p>
++              <p className={`text-2xl font-black mt-2 ${changePercent !== null && changePercent >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
++                {changePercent !== null ? `${changePercent.toFixed(1)}%` : 'N/A'}
++              </p>
++              <p className="text-[10px] text-on-surface-variant mt-1">{overviewScan?.season || '—'}</p>
++            </div>
++            <div className="bg-white rounded-xl p-4 border border-slate-100">
++              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Tình trạng mốc</p>
++              <p className="text-2xl font-black text-primary mt-2">{hoaBinhOverview.markers_warning}/{hoaBinhOverview.markers_total}</p>
++              <p className="text-[10px] text-on-surface-variant mt-1">Mốc cần kiểm tra</p>
++            </div>
++            <div className="bg-white rounded-xl p-4 border border-slate-100">
++              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Nhiệm vụ</p>
++              <p className="text-2xl font-black text-primary mt-2">
++                {hoaBinhOverview.tasks_in_progress}/{hoaBinhOverview.tasks_total}
++              </p>
++              <p className="text-[10px] text-on-surface-variant mt-1">Đang xử lý</p>
++            </div>
++            <div className="bg-white rounded-xl p-4 border border-slate-100">
++              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Cảnh báo</p>
++              <p className="text-2xl font-black text-primary mt-2">{overviewScan?.alert_level || 'N/A'}</p>
++              <p className="text-[10px] text-on-surface-variant mt-1">
++                {overviewScan?.capture_date ? new Date(overviewScan.capture_date).toLocaleDateString('vi-VN') : 'Chưa quét'}
++              </p>
++            </div>
++          </div>
++        </section>
++      )}
++
+       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+         {/* Reservoir Status Overview Table */}
+         <section className="lg:col-span-8">
+diff --git a/frontend/src/pages/Reservoirs.tsx b/frontend/src/pages/Reservoirs.tsx
+index 7cd3994..cddadb2 100644
+--- a/frontend/src/pages/Reservoirs.tsx
++++ b/frontend/src/pages/Reservoirs.tsx
+@@ -4,11 +4,11 @@ import 'leaflet/dist/leaflet.css';
+ import {
+   FileText, MapPin, Plus, ShieldCheck, Trash2, Pencil, Search, Waves, Flag, AlertTriangle,
+   ChevronRight, Eye, MapPinOff, CircleDot, X, Upload, Clock, CheckCircle2, XCircle,
+-  Satellite, BarChart3, Navigation, Crosshair
++  Satellite, BarChart3, Navigation, Crosshair, ClipboardCheck
+ } from 'lucide-react';
+ import L from 'leaflet';
+ import { useSearchParams } from 'react-router-dom';
+-import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory, LocationLogRaw } from '../services/api';
++import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory, LocationLogRaw, User, ShorelineBoundary, SurveyPlan, FloodExpansion } from '../services/api';
+ 
+ const SENTINEL2_TILE_URL = (import.meta.env.VITE_SENTINEL2_TILE_URL || '').trim();
+ const SENTINEL2_ATTRIBUTION =
+@@ -79,6 +79,22 @@ const taskStatusColor: Record<string, { bg: string; text: string }> = {
+   cancelled: { bg: 'bg-slate-100', text: 'text-slate-500' }
+ };
+ 
++const planStatusLabel: Record<SurveyPlanForm['status'], string> = {
++  draft: 'Nháp',
++  assigned: 'Đã giao',
++  in_progress: 'Đang thực hiện',
++  completed: 'Hoàn thành',
++  archived: 'Lưu trữ'
++};
++
++const planStatusColor: Record<SurveyPlanForm['status'], { bg: string; text: string }> = {
++  draft: { bg: 'bg-slate-100', text: 'text-slate-600' },
++  assigned: { bg: 'bg-blue-50', text: 'text-blue-700' },
++  in_progress: { bg: 'bg-amber-50', text: 'text-amber-700' },
++  completed: { bg: 'bg-emerald-50', text: 'text-emerald-700' },
++  archived: { bg: 'bg-slate-200', text: 'text-slate-500' }
++};
++
+ const taskPriorityVi: Record<string, string> = {
+   low: 'Thấp',
+   medium: 'Trung bình',
+@@ -181,6 +197,25 @@ type MarkerForm = {
+   lat: string;
+ };
+ 
++type SurveyPlanForm = {
++  title: string;
++  area: string;
++  markerIds: string[];
++  startDate: string;
++  endDate: string;
++  leadUserId: string;
++  checklistText: string;
++  status: 'draft' | 'assigned' | 'in_progress' | 'completed' | 'archived';
++};
++
++type ShorelineLayerState = {
++  normal: boolean;
++  dry: boolean;
++  wet: boolean;
++  scan: boolean;
++  flood: boolean;
++};
++
+ /* ─── Utilities ──────────────────────────────────────────────────── */
+ function MapUpdater({ center }: { center: [number, number] }) {
+   const map = useMap();
+@@ -210,6 +245,21 @@ function pointInPolygon(point: [number, number], polygon: [number, number][]) {
+   return inside;
+ }
+ 
++function normalizeText(value: string) {
++  return value
++    .normalize('NFD')
++    .replace(/[\u0300-\u036f]/g, '')
++    .toLowerCase();
++}
++
++function polygonToLatLng(boundary: { type: 'Polygon'; coordinates: number[][][] }) {
++  if (!boundary || boundary.type !== 'Polygon' || !boundary.coordinates.length) {
++    return [] as [number, number][];
++  }
++
++  return boundary.coordinates[0].map(([lng, lat]) => [lat, lng]);
++}
++
+ function MapClickCapture({
+   enabled,
+   onClick
+@@ -271,10 +321,39 @@ export default function Reservoirs() {
+   const [reportDraft, setReportDraft] = useState({ description: '', conditionStatus: 'good' });
+   const [satelliteHistory, setSatelliteHistory] = useState<SatelliteHistory[]>([]);
+   const [satelliteLoading, setSatelliteLoading] = useState(false);
++  const [shorelines, setShorelines] = useState<ShorelineBoundary[]>([]);
++  const [floodExpansion, setFloodExpansion] = useState<FloodExpansion | null>(null);
++  const [shorelineLoading, setShorelineLoading] = useState(false);
+   const [loading, setLoading] = useState(true);
+   const [working, setWorking] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const [selectedSceneId, setSelectedSceneId] = useState<string | null>(null);
++  const [selectedBoundaryId, setSelectedBoundaryId] = useState<string | null>(null);
++
++  const [surveyPlans, setSurveyPlans] = useState<SurveyPlan[]>([]);
++  const [planLoading, setPlanLoading] = useState(false);
++  const [planModalOpen, setPlanModalOpen] = useState(false);
++  const [planSubmitting, setPlanSubmitting] = useState(false);
++  const [planLeads, setPlanLeads] = useState<User[]>([]);
++
++  const [shorelineLayers, setShorelineLayers] = useState<ShorelineLayerState>({
++    normal: true,
++    dry: true,
++    wet: true,
++    scan: true,
++    flood: true
++  });
++
++  const [planForm, setPlanForm] = useState<SurveyPlanForm>({
++    title: '',
++    area: '',
++    markerIds: [],
++    startDate: new Date().toISOString().slice(0, 10),
++    endDate: new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10),
++    leadUserId: '',
++    checklistText: '',
++    status: 'draft'
++  });
+ 
+   const [reservoirModalOpen, setReservoirModalOpen] = useState(false);
+   const [reservoirModalMode, setReservoirModalMode] = useState<'create' | 'edit'>('create');
+@@ -308,10 +387,38 @@ export default function Reservoirs() {
+   const currentTask = useMemo(() => reservoirTasks.find((t) => t.id === selectedTaskId), [reservoirTasks, selectedTaskId]);
+   const currentCenter: [number, number] = currentReservoir?.center || [20.825, 105.284];
+   const currentBoundary = currentReservoir?.boundary || [];
++  const latestNormalBoundary = useMemo(
++    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'normal'),
++    [shorelines]
++  );
++  const latestDryBoundary = useMemo(
++    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'dry'),
++    [shorelines]
++  );
++  const latestWetBoundary = useMemo(
++    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'wet'),
++    [shorelines]
++  );
++  const currentScanBoundary = useMemo(
++    () => shorelines.find((b) => b.is_current) || shorelines.find((b) => b.boundary_type === 'scan'),
++    [shorelines]
++  );
++  const highlightedBoundary = useMemo(
++    () => shorelines.find((b) => b.id === selectedBoundaryId) || null,
++    [shorelines, selectedBoundaryId]
++  );
+   const sentinelEnabled = Boolean(SENTINEL2_TILE_URL);
+   const tileUrl = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_TILE_URL : ESRI_TILE_URL;
+   const tileAttribution = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_ATTRIBUTION : ESRI_ATTRIBUTION;
+ 
++  const shorelineLayerOptions: { key: keyof ShorelineLayerState; label: string; color: string }[] = [
++    { key: 'normal', label: 'Hiện trạng', color: 'bg-slate-700' },
++    { key: 'dry', label: 'Mùa khô', color: 'bg-amber-500' },
++    { key: 'wet', label: 'Mùa mưa', color: 'bg-blue-500' },
++    { key: 'scan', label: 'Quét mới', color: 'bg-emerald-500' },
++    { key: 'flood', label: 'Ngập mở rộng', color: 'bg-cyan-400' }
++  ];
++
+   const currentBounds = useMemo(() => {
+     if (!currentBoundary || currentBoundary.length === 0) return null;
+     const lats = currentBoundary.map(p => p[0]);
+@@ -340,7 +447,8 @@ export default function Reservoirs() {
+     setReservoirs(rows);
+ 
+     const quickId = searchParams.get('reservoirId');
+-    const picked = preferredId || quickId || activeReservoir || rows[0]?.id || '';
++    const hoaBinh = rows.find((r) => normalizeText(r.name).includes('hoa binh'));
++    const picked = preferredId || quickId || activeReservoir || hoaBinh?.id || rows[0]?.id || '';
+     if (picked && rows.some((r) => r.id === picked)) {
+       setActiveReservoir(picked);
+     } else {
+@@ -413,6 +521,7 @@ export default function Reservoirs() {
+       try {
+         setError(null);
+         await loadReservoirs();
++        await loadPlanLeads();
+       } catch (e) {
+         setError(e instanceof Error ? e.message : 'Không thể tải danh sách hồ chứa');
+       } finally {
+@@ -439,13 +548,77 @@ export default function Reservoirs() {
+     }
+   };
+ 
++  const loadShorelines = async (reservoirId: string) => {
++    if (!reservoirId) {
++      setShorelines([]);
++      return;
++    }
++
++    setShorelineLoading(true);
++    try {
++      const rows = await api.getShorelines(reservoirId);
++      setShorelines(rows);
++    } catch (e) {
++      console.error(e);
++      setShorelines([]);
++    } finally {
++      setShorelineLoading(false);
++    }
++  };
++
++  const loadFloodExpansion = async (reservoirId: string) => {
++    if (!reservoirId) {
++      setFloodExpansion(null);
++      return;
++    }
++
++    try {
++      const expansion = await api.getFloodExpansion(reservoirId);
++      setFloodExpansion(expansion);
++    } catch (e) {
++      setFloodExpansion(null);
++    }
++  };
++
++  const loadSurveyPlans = async (reservoirId: string) => {
++    if (!reservoirId) {
++      setSurveyPlans([]);
++      return;
++    }
++
++    setPlanLoading(true);
++    try {
++      const rows = await api.getSurveyPlans(reservoirId);
++      setSurveyPlans(rows);
++    } catch (e) {
++      console.error(e);
++      setSurveyPlans([]);
++    } finally {
++      setPlanLoading(false);
++    }
++  };
++
++  const loadPlanLeads = async () => {
++    try {
++      const users = await api.getUsers();
++      setPlanLeads(users.filter((u) => u.is_active));
++    } catch (e) {
++      setPlanLeads([]);
++    }
++  };
++
+   useEffect(() => {
+     const run = async () => {
+       try {
+         setError(null);
++        setSelectedSceneId(null);
++        setSelectedBoundaryId(null);
+         await loadMarkers(activeReservoir);
+         await loadReservoirTasks(activeReservoir);
+         await loadSatelliteHistory(activeReservoir);
++        await loadShorelines(activeReservoir);
++        await loadFloodExpansion(activeReservoir);
++        await loadSurveyPlans(activeReservoir);
+       } catch (e) {
+         setError(e instanceof Error ? e.message : 'Không thể tải chi tiết hồ');
+       }
+@@ -727,11 +900,76 @@ export default function Reservoirs() {
+   const submitSatelliteAnalysis = async () => {
+     if (!activeReservoir) return;
+     await withAction(async () => {
+-      await api.triggerSatelliteAnalysis(activeReservoir);
++      await api.triggerSatelliteAnalysis(activeReservoir, undefined, 'gee');
+       await loadSatelliteHistory(activeReservoir);
++      await loadShorelines(activeReservoir);
++      await loadFloodExpansion(activeReservoir);
++    });
++  };
++
++  const resetPlanForm = () => {
++    setPlanForm({
++      title: '',
++      area: '',
++      markerIds: [],
++      startDate: new Date().toISOString().slice(0, 10),
++      endDate: new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10),
++      leadUserId: '',
++      checklistText: '',
++      status: 'draft'
++    });
++  };
++
++  const togglePlanMarker = (markerId: string) => {
++    setPlanForm((prev) => {
++      const exists = prev.markerIds.includes(markerId);
++      return {
++        ...prev,
++        markerIds: exists ? prev.markerIds.filter((id) => id !== markerId) : [...prev.markerIds, markerId]
++      };
+     });
+   };
+ 
++  const submitSurveyPlan = async () => {
++    if (!activeReservoir) {
++      return;
++    }
++
++    if (!planForm.title.trim()) {
++      setError('Vui lòng nhập tên kế hoạch khảo sát');
++      return;
++    }
++
++    setPlanSubmitting(true);
++    setError(null);
++    try {
++      const checklist = planForm.checklistText
++        .split('\n')
++        .map((line) => line.trim())
++        .filter(Boolean);
++
++      await api.createSurveyPlan({
++        reservoirId: activeReservoir,
++        title: planForm.title.trim(),
++        area: planForm.area || undefined,
++        markerIds: planForm.markerIds.length ? planForm.markerIds : undefined,
++        startDate: planForm.startDate || undefined,
++        endDate: planForm.endDate || undefined,
++        leadUserId: planForm.leadUserId || undefined,
++        checklist: checklist.length ? checklist : undefined,
++        status: planForm.status
++      });
++
++      setPlanModalOpen(false);
++      resetPlanForm();
++      await loadSurveyPlans(activeReservoir);
++    } catch (e) {
++      setError(e instanceof Error ? e.message : 'Không thể tạo kế hoạch khảo sát');
++    } finally {
++      setPlanSubmitting(false);
++    }
++  };
++
+   if (loading) {
+     return (
+       <div className="flex items-center justify-center h-full min-h-[400px]">
+@@ -854,6 +1092,87 @@ export default function Reservoirs() {
+                     key={reservoir.id}
+                     className={`p-3.5 rounded-xl cursor-pointer transition-all group ${isActive
+                         ? 'bg-primary/[0.06] border border-primary/20 shadow-[0_2px_8px_rgba(0,51,88,0.06)]'
++              {/* ── Survey Plans ─────────────────────────────────────────── */}
++              <div className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_4px_16px_rgba(0,51,88,0.04)]">
++                <div className="flex justify-between items-center mb-5">
++                  <div>
++                    <h3 className="text-base font-black text-primary flex items-center gap-2">
++                      <ClipboardCheck className="w-5 h-5" /> Kế hoạch khảo sát
++                    </h3>
++                    <p className="text-[11px] text-on-surface-variant mt-1">Lập kế hoạch điều tra cột mốc, theo dõi tiến độ triển khai.</p>
++                  </div>
++                  <button
++                    onClick={() => {
++                      resetPlanForm();
++                      setPlanModalOpen(true);
++                    }}
++                    disabled={!activeReservoir || planSubmitting}
++                    className="px-4 py-2 bg-primary text-white rounded-xl text-xs font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
++                  >
++                    Tạo kế hoạch
++                  </button>
++                </div>
++
++                {planLoading && (
++                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
++                    {[1, 2].map((i) => (
++                      <div key={i} className="h-28 rounded-xl shimmer"></div>
++                    ))}
++                  </div>
++                )}
++
++                {!planLoading && surveyPlans.length === 0 && (
++                  <div className="py-10 text-center border-2 border-dashed border-slate-200 rounded-xl">
++                    <ClipboardCheck className="w-10 h-10 text-on-surface-variant/15 mx-auto mb-3" />
++                    <p className="text-sm font-medium text-on-surface-variant">Chưa có kế hoạch khảo sát</p>
++                    <p className="text-[11px] text-on-surface-variant/60 mt-1">Bấm "Tạo kế hoạch" để bắt đầu quy trình điều tra</p>
++                  </div>
++                )}
++
++                {!planLoading && surveyPlans.length > 0 && (
++                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
++                    {surveyPlans.map((plan) => {
++                      const pColor = planStatusColor[plan.status];
++                      const planRange = plan.start_date || plan.end_date
++                        ? `${plan.start_date ? new Date(plan.start_date).toLocaleDateString('vi-VN') : 'N/A'} - ${plan.end_date ? new Date(plan.end_date).toLocaleDateString('vi-VN') : 'N/A'}`
++                        : 'Chưa đặt lịch';
++
++                      return (
++                        <div key={plan.id} className="border border-slate-100 rounded-xl p-4 bg-white hover:shadow-sm transition-shadow">
++                          <div className="flex items-start justify-between gap-3">
++                            <div>
++                              <p className="text-sm font-black text-primary">{plan.title}</p>
++                              <p className="text-[11px] text-on-surface-variant mt-1">{plan.area || 'Chưa ghi khu vực'}</p>
++                            </div>
++                            <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${pColor.bg} ${pColor.text}`}>
++                              {planStatusLabel[plan.status]}
++                            </span>
++                          </div>
++                          <div className="grid grid-cols-2 gap-3 mt-4 text-[11px] text-on-surface-variant">
++                            <div>
++                              <p className="font-semibold text-[10px] uppercase tracking-widest">Thời gian</p>
++                              <p className="mt-1 text-xs text-on-surface">{planRange}</p>
++                            </div>
++                            <div>
++                              <p className="font-semibold text-[10px] uppercase tracking-widest">Phụ trách</p>
++                              <p className="mt-1 text-xs text-on-surface">{plan.lead_name || 'Chưa phân công'}</p>
++                            </div>
++                            <div>
++                              <p className="font-semibold text-[10px] uppercase tracking-widest">Cột mốc</p>
++                              <p className="mt-1 text-xs text-on-surface">{plan.marker_ids.length}</p>
++                            </div>
++                            <div>
++                              <p className="font-semibold text-[10px] uppercase tracking-widest">Checklist</p>
++                              <p className="mt-1 text-xs text-on-surface">{plan.checklist.length}</p>
++                            </div>
++                          </div>
++                        </div>
++                      );
++                    })}
++                  </div>
++                )}
++              </div>
++
+                         : 'hover:bg-surface-container-low border border-transparent'
+                       }`}
+                     onClick={() => setActiveReservoir(reservoir.id)}
+@@ -936,7 +1255,45 @@ export default function Reservoirs() {
+                   zIndex={10}
+                 />
+               )}
+-              {currentBoundary.length > 0 && <Polygon positions={currentBoundary} pathOptions={{ color: '#003358', fillColor: '#004a7c', fillOpacity: 0.2 }} />}
++              {currentBoundary.length > 0 && shorelineLayers.normal && (
++                <Polygon positions={currentBoundary} pathOptions={{ color: '#003358', fillColor: '#004a7c', fillOpacity: 0.12 }} />
++              )}
++              {latestNormalBoundary && shorelineLayers.normal && (
++                <Polygon
++                  positions={polygonToLatLng(latestNormalBoundary.boundary_geojson)}
++                  pathOptions={{ color: '#0f172a', weight: 2, dashArray: '4 6', fillOpacity: 0 }}
++                />
++              )}
++              {latestDryBoundary && shorelineLayers.dry && (
++                <Polygon
++                  positions={polygonToLatLng(latestDryBoundary.boundary_geojson)}
++                  pathOptions={{ color: '#f59e0b', weight: 2.5, fillOpacity: 0.08, fillColor: '#fcd34d' }}
++                />
++              )}
++              {latestWetBoundary && shorelineLayers.wet && (
++                <Polygon
++                  positions={polygonToLatLng(latestWetBoundary.boundary_geojson)}
++                  pathOptions={{ color: '#2563eb', weight: 2.5, fillOpacity: 0.08, fillColor: '#93c5fd' }}
++                />
++              )}
++              {currentScanBoundary && shorelineLayers.scan && (
++                <Polygon
++                  positions={polygonToLatLng(currentScanBoundary.boundary_geojson)}
++                  pathOptions={{ color: '#14b8a6', weight: 3, fillOpacity: 0.05, fillColor: '#5eead4' }}
++                />
++              )}
++              {floodExpansion && shorelineLayers.flood && (
++                <Polygon
++                  positions={polygonToLatLng(floodExpansion.boundary_geojson)}
++                  pathOptions={{ color: '#22d3ee', weight: 2.5, fillOpacity: 0.08, fillColor: '#67e8f9' }}
++                />
++              )}
++              {highlightedBoundary && (
++                <Polygon
++                  positions={polygonToLatLng(highlightedBoundary.boundary_geojson)}
++                  pathOptions={{ color: '#f97316', weight: 4, fillOpacity: 0, dashArray: '2 4' }}
++                />
++              )}
+               {markers.map((marker) => (
+                 <LeafletMarker
+                   key={marker.id}
+@@ -967,6 +1324,12 @@ export default function Reservoirs() {
+               </div>
+             )}
+ 
++            {shorelineLoading && (
++              <div className="absolute top-14 left-3 bg-white/90 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-on-surface-variant shadow-lg animate-fade-in-up">
++                Đang tải lớp ranh giới...
++              </div>
++            )}
++
+             {/* Map Layer Toggle */}
+             <div className="absolute top-3 right-3 bg-white/95 backdrop-blur-md px-1.5 py-1.5 rounded-xl text-xs font-bold text-primary shadow-lg flex gap-1">
+               <button
+@@ -993,6 +1356,33 @@ export default function Reservoirs() {
+               </button>
+             </div>
+ 
++            <div className="absolute top-14 right-3 bg-white/95 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-primary shadow-lg space-y-2 w-40">
++              <div className="text-[9px] uppercase tracking-widest text-on-surface-variant">Lớp ranh giới</div>
++              <div className="space-y-1">
++                {shorelineLayerOptions.map((layer) => (
++                  <button
++                    key={layer.key}
++                    className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg transition-colors ${shorelineLayers[layer.key]
++                        ? 'bg-primary/10 text-primary'
++                        : 'text-on-surface-variant hover:bg-surface-container'
++                      }`}
++                    onClick={() =>
++                      setShorelineLayers((prev) => ({
++                        ...prev,
++                        [layer.key]: !prev[layer.key]
++                      }))
++                    }
++                  >
++                    <div className="flex items-center gap-2">
++                      <span className={`w-2 h-2 rounded-full ${layer.color}`}></span>
++                      <span>{layer.label}</span>
++                    </div>
++                    <span>{shorelineLayers[layer.key] ? 'On' : 'Off'}</span>
++                  </button>
++                ))}
++              </div>
++            </div>
++
+             {/* Map Info Overlay */}
+             {currentReservoir && (
+               <div className="absolute bottom-3 left-3 bg-white/90 backdrop-blur-md px-4 py-3 rounded-xl shadow-lg max-w-xs">
+@@ -1439,9 +1829,9 @@ export default function Reservoirs() {
+             <div className="flex justify-between items-center mb-5">
+               <div>
+                 <h3 className="text-base font-black text-primary flex items-center gap-2">
+-                  <Satellite className="w-5 h-5" /> Phân tích vệ tinh PlanetScope
++                    <Satellite className="w-5 h-5" /> Phân tích vệ tinh GEE
+                 </h3>
+-                <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử đánh giá diện tích mặt nước qua ảnh vệ tinh phân giải cao (3m)</p>
++                  <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử quét ảnh theo mùa (mưa/khô) và so sánh với baseline phù hợp</p>
+               </div>
+               <button
+                 onClick={submitSatelliteAnalysis}
+@@ -1450,7 +1840,7 @@ export default function Reservoirs() {
+                 title="Có thể mất đến 1 phút"
+               >
+                 <Satellite className="w-3.5 h-3.5" />
+-                {working ? 'Đang phân tích...' : 'Quét vệ tinh mới nhất'}
++                  {working ? 'Đang phân tích...' : 'Quét GEE mới nhất'}
+               </button>
+             </div>
+ 
+@@ -1469,9 +1859,35 @@ export default function Reservoirs() {
+ 
+             {!satelliteLoading && satelliteHistory && satelliteHistory.length > 0 && (
+               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+-                {satelliteHistory.slice(0, 4).map((record) => (
+-                  <div key={record.id} className="border border-slate-100 rounded-xl overflow-hidden bg-white shadow-sm hover:shadow-md transition-all card-hover-lift flex flex-col">
+-                    <div className="h-40 bg-slate-100 relative group overflow-hidden cursor-zoom-in" onClick={() => setSelectedSceneId(record.raw_response.scene_id)}>
++                {satelliteHistory.slice(0, 4).map((record) => {
++                  const seasonLabel = record.season === 'wet'
++                    ? 'Mùa mưa'
++                    : record.season === 'dry'
++                      ? 'Mùa khô'
++                      : record.season === 'normal'
++                        ? 'Bình thường'
++                        : 'Chuyển mùa';
++                  const compareLabel = record.compare_mode === 'seasonal'
++                    ? 'So với baseline'
++                    : record.compare_mode === 'previous'
++                      ? 'So với lần trước'
++                      : 'Chưa có baseline';
++                  const changeValue = Number(record.change_percentage || 0);
++
++                  return (
++                    <div key={record.id} className="border border-slate-100 rounded-xl overflow-hidden bg-white shadow-sm hover:shadow-md transition-all card-hover-lift flex flex-col">
++                      <div
++                        className="h-40 bg-slate-100 relative group overflow-hidden cursor-pointer"
++                        onClick={() => {
++                          if (record.boundary_id) {
++                            setSelectedBoundaryId(record.boundary_id);
++                            setSelectedSceneId(null);
++                          } else if (record.raw_response?.scene_id) {
++                            setSelectedSceneId(record.raw_response.scene_id);
++                            setSelectedBoundaryId(null);
++                          }
++                        }}
++                      >
+                       {record.raw_response?.scene_id ? (
+                         <img
+                           src={`http://localhost:4000/api/satellite/thumbnail/${record.raw_response.scene_id}`}
+@@ -1490,13 +1906,27 @@ export default function Reservoirs() {
+                       <div className="absolute inset-0 bg-gradient-to-t from-black/30 to-transparent z-10 opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                     </div>
+                     <div className="px-3.5 pt-3.5 pb-3 flex-1 flex flex-col">
++                      <div className="flex justify-between items-center mb-2">
++                        <span className="text-[10px] font-semibold text-slate-500 uppercase">Mùa</span>
++                        <span className="text-xs font-bold text-slate-700">{seasonLabel}</span>
++                      </div>
+                       <div className="flex justify-between items-center mb-2">
+                         <span className="text-[10px] font-semibold text-slate-500 uppercase">Diện tích</span>
+                         <span className="text-xs font-black text-primary">{(record.water_surface_area / 10000).toLocaleString(undefined, { maximumFractionDigits: 2 })} ha</span>
+                       </div>
+                       <div className="flex justify-between items-center mb-2">
+                         <span className="text-[10px] font-semibold text-slate-500 uppercase">Mây che phủ</span>
+-                        <span className="text-xs font-bold text-slate-700">{(record.raw_response?.cloud_cover * 100).toFixed(1)}%</span>
++                        <span className="text-xs font-bold text-slate-700">
++                          {record.raw_response?.cloud_cover !== undefined
++                            ? `${(record.raw_response.cloud_cover * 100).toFixed(1)}%`
++                            : 'N/A'}
++                        </span>
++                      </div>
++                      <div className="flex justify-between items-center mb-2">
++                        <span className="text-[10px] font-semibold text-slate-500 uppercase">{compareLabel}</span>
++                        <span className={`text-xs font-black ${changeValue >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
++                          {changeValue.toFixed(1)}%
++                        </span>
+                       </div>
+                       <div className="flex justify-between items-center mt-auto border-t border-slate-50 pt-2.5">
+                         <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-tight">Cảnh báo</span>
+@@ -1509,7 +1939,8 @@ export default function Reservoirs() {
+                       </div>
+                     </div>
+                   </div>
+-                ))}
++                  );
++                })}
+               </div>
+             )}
+           </div>
+@@ -1518,6 +1949,144 @@ export default function Reservoirs() {
+ 
+       {/* ═══ Modals ══════════════════════════════════════════════════ */}
+ 
++      {/* Survey Plan Modal */}
++      {planModalOpen && (
++        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-[110] flex items-center justify-center p-4 animate-overlay-in">
++          <div className="bg-white w-full max-w-3xl rounded-2xl shadow-2xl animate-modal-in">
++            <div className="p-5 border-b border-slate-100 flex justify-between items-center">
++              <div>
++                <h3 className="font-black text-primary text-lg">Tạo kế hoạch khảo sát</h3>
++                <p className="text-[11px] text-on-surface-variant mt-0.5">Thiết lập khu vực, mốc kiểm tra và checklist cho worker.</p>
++              </div>
++              <button onClick={() => setPlanModalOpen(false)} className="p-2 hover:bg-surface-container rounded-lg transition-colors">
++                <X className="w-5 h-5 text-on-surface-variant" />
++              </button>
++            </div>
++
++            <div className="p-5 space-y-4">
++              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
++                <div>
++                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Tên kế hoạch</label>
++                  <input
++                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                    placeholder="VD: Điều tra mốc bờ Tây"
++                    value={planForm.title}
++                    onChange={(e) => setPlanForm({ ...planForm, title: e.target.value })}
++                  />
++                </div>
++                <div>
++                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Trạng thái</label>
++                  <select
++                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                    value={planForm.status}
++                    onChange={(e) => setPlanForm({ ...planForm, status: e.target.value as SurveyPlanForm['status'] })}
++                  >
++                    {(Object.keys(planStatusLabel) as SurveyPlanForm['status'][]).map((status) => (
++                      <option key={status} value={status}>
++                        {planStatusLabel[status]}
++                      </option>
++                    ))}
++                  </select>
++                </div>
++              </div>
++
++              <div>
++                <label className="block text-xs font-bold mb-1.5 text-on-surface">Khu vực khảo sát</label>
++                <input
++                  className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                  placeholder="VD: Bờ Bắc - tràn xả"
++                  value={planForm.area}
++                  onChange={(e) => setPlanForm({ ...planForm, area: e.target.value })}
++                />
++              </div>
++
++              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
++                <div>
++                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Bắt đầu</label>
++                  <input
++                    type="date"
++                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                    value={planForm.startDate}
++                    onChange={(e) => setPlanForm({ ...planForm, startDate: e.target.value })}
++                  />
++                </div>
++                <div>
++                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Kết thúc</label>
++                  <input
++                    type="date"
++                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                    value={planForm.endDate}
++                    onChange={(e) => setPlanForm({ ...planForm, endDate: e.target.value })}
++                  />
++                </div>
++                <div>
++                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Phụ trách</label>
++                  <select
++                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
++                    value={planForm.leadUserId}
++                    onChange={(e) => setPlanForm({ ...planForm, leadUserId: e.target.value })}
++                  >
++                    <option value="">Chưa phân công</option>
++                    {planLeads.map((user) => (
++                      <option key={user.id} value={user.id}>
++                        {user.full_name}
++                      </option>
++                    ))}
++                  </select>
++                </div>
++              </div>
++
++              <div>
++                <label className="block text-xs font-bold mb-1.5 text-on-surface">Checklist (mỗi dòng 1 mục)</label>
++                <textarea
++                  className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all resize-none"
++                  rows={4}
++                  placeholder="Ví dụ:\n- Kiểm tra mốc A1\n- Chụp ảnh hiện trạng"
++                  value={planForm.checklistText}
++                  onChange={(e) => setPlanForm({ ...planForm, checklistText: e.target.value })}
++                />
++              </div>
++
++              <div>
++                <label className="block text-xs font-bold mb-1.5 text-on-surface">Chọn cột mốc khảo sát</label>
++                <div className="border border-slate-200 rounded-xl p-3 max-h-36 overflow-y-auto space-y-2">
++                  {markers.length === 0 && (
++                    <p className="text-xs text-on-surface-variant">Chưa có cột mốc cho hồ này.</p>
++                  )}
++                  {markers.map((marker) => (
++                    <label key={marker.id} className="flex items-center gap-2 text-xs text-on-surface">
++                      <input
++                        type="checkbox"
++                        checked={planForm.markerIds.includes(marker.id)}
++                        onChange={() => togglePlanMarker(marker.id)}
++                      />
++                      <span className="font-semibold">{marker.code}</span>
++                      <span className="text-on-surface-variant">{marker.name}</span>
++                    </label>
++                  ))}
++                </div>
++              </div>
++
++              <div className="flex gap-3 pt-2">
++                <button
++                  onClick={() => setPlanModalOpen(false)}
++                  className="flex-1 py-3 rounded-xl bg-surface-container text-on-surface text-sm font-bold hover:bg-surface-container-high transition-colors"
++                >
++                  Hủy bỏ
++                </button>
++                <button
++                  onClick={submitSurveyPlan}
++                  disabled={planSubmitting}
++                  className="flex-1 py-3 rounded-xl bg-primary text-white text-sm font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
++                >
++                  {planSubmitting ? 'Đang tạo...' : 'Tạo kế hoạch'}
++                </button>
++              </div>
++            </div>
++          </div>
++        </div>
++      )}
++
+       {/* Reservoir Create/Edit Modal */}
+       {reservoirModalOpen && (
+         <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-[110] flex items-center justify-center p-4 animate-overlay-in">
+diff --git a/frontend/src/pages/TaskManagement.tsx b/frontend/src/pages/TaskManagement.tsx
+index 216ce10..426dc34 100644
+--- a/frontend/src/pages/TaskManagement.tsx
++++ b/frontend/src/pages/TaskManagement.tsx
+@@ -1,6 +1,6 @@
+ import { useEffect, useMemo, useState } from 'react';
+ import { Calendar, CheckCircle2, PlusCircle, X } from 'lucide-react';
+-import { api, Marker, Reservoir, Task, User } from '../services/api';
++import { api, Marker, Reservoir, Task, User, SurveyPlan } from '../services/api';
+ 
+ type TaskForm = {
+   title: string;
+@@ -8,6 +8,7 @@ type TaskForm = {
+   template: string;
+   reservoirId: string;
+   markerId: string;
++  planId: string;
+   assignedTo: string;
+   priority: 'low' | 'medium' | 'high' | 'urgent';
+   dueDate: string;
+@@ -27,6 +28,7 @@ const initialForm: TaskForm = {
+   template: taskTemplates[0].value,
+   reservoirId: '',
+   markerId: '',
++  planId: '',
+   assignedTo: '',
+   priority: 'medium',
+   dueDate: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10)
+@@ -38,6 +40,7 @@ export default function TaskManagement() {
+   const [reservoirs, setReservoirs] = useState<Reservoir[]>([]);
+   const [markers, setMarkers] = useState<Marker[]>([]);
+   const [workers, setWorkers] = useState<User[]>([]);
++  const [surveyPlans, setSurveyPlans] = useState<SurveyPlan[]>([]);
+   const [loading, setLoading] = useState(true);
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+@@ -65,6 +68,21 @@ export default function TaskManagement() {
+     });
+   };
+ 
++  const loadPlans = async (reservoirId: string) => {
++    if (!reservoirId) {
++      setSurveyPlans([]);
++      setForm((prev) => ({ ...prev, planId: '' }));
++      return;
++    }
++
++    const rows = await api.getSurveyPlans(reservoirId);
++    setSurveyPlans(rows);
++    setForm((prev) => ({
++      ...prev,
++      planId: prev.planId && rows.some((p) => p.id === prev.planId) ? prev.planId : rows[0]?.id || ''
++    }));
++  };
++
+   const loadData = async () => {
+     const [taskRows, reservoirRows, userRows] = await Promise.all([
+       api.getTasks(),
+@@ -86,6 +104,7 @@ export default function TaskManagement() {
+     }));
+ 
+     await loadMarkers(nextReservoirId);
++    await loadPlans(nextReservoirId);
+   };
+ 
+   useEffect(() => {
+@@ -118,6 +137,7 @@ export default function TaskManagement() {
+       await api.createTask({
+         reservoirId: form.reservoirId,
+         markerId: form.markerId || undefined,
++        planId: form.planId || undefined,
+         assignedTo: form.assignedTo || undefined,
+         title: form.title,
+         description: form.description,
+@@ -131,6 +151,7 @@ export default function TaskManagement() {
+       const nextAssignedTo = workers[0]?.id || '';
+       setForm({ ...initialForm, reservoirId: nextReservoirId, assignedTo: nextAssignedTo, markerId: '' });
+       await loadMarkers(nextReservoirId);
++      await loadPlans(nextReservoirId);
+     } catch (e) {
+       setError(e instanceof Error ? e.message : 'Tao task that bai');
+     } finally {
+@@ -191,6 +212,9 @@ export default function TaskManagement() {
+         </select>
+       </div>
+       <h4 className="font-bold text-primary mb-1">{task.title}</h4>
++      {task.plan_title && (
++        <p className="text-[10px] text-on-surface-variant mb-1">Kế hoạch: {task.plan_title}</p>
++      )}
+       <p className="text-xs text-on-surface-variant mb-4 line-clamp-2">{task.description}</p>
+       <div className="space-y-2">
+         <div className="flex items-center justify-between text-[10px] font-bold text-on-surface-variant">
+@@ -327,10 +351,11 @@ export default function TaskManagement() {
+                     value={form.reservoirId}
+                     onChange={async (e) => {
+                       const nextReservoirId = e.target.value;
+-                      setForm((prev) => ({ ...prev, reservoirId: nextReservoirId, markerId: '' }));
++                      setForm((prev) => ({ ...prev, reservoirId: nextReservoirId, markerId: '', planId: '' }));
+                       try {
+                         setError(null);
+                         await loadMarkers(nextReservoirId);
++                        await loadPlans(nextReservoirId);
+                       } catch (err) {
+                         setError(err instanceof Error ? err.message : 'Khong the tai danh sach moc giam sat');
+                       }
+@@ -377,6 +402,22 @@ export default function TaskManagement() {
+                   </select>
+                 </div>
+               </div>
++              <div>
++                <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Kế hoạch khảo sát</label>
++                <select
++                  className="w-full bg-surface-container-highest border-none rounded-lg focus:ring-2 focus:ring-surface-tint p-3 text-sm outline-none"
++                  value={form.planId}
++                  onChange={(e) => setForm({ ...form, planId: e.target.value })}
++                  disabled={!form.reservoirId}
++                >
++                  <option value="">Không gắn kế hoạch</option>
++                  {surveyPlans.map((plan) => (
++                    <option value={plan.id} key={plan.id}>
++                      {plan.title}
++                    </option>
++                  ))}
++                </select>
++              </div>
+               <div className="grid grid-cols-2 gap-4">
+                 <div>
+                   <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Độ ưu tiên</label>
+diff --git a/frontend/src/services/api.ts b/frontend/src/services/api.ts
+index 41874fb..570de04 100644
+--- a/frontend/src/services/api.ts
++++ b/frontend/src/services/api.ts
+@@ -5,6 +5,10 @@ type MarkerStatus = 'normal' | 'damaged' | 'missing' | 'needs_inspection';
+ type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled';
+ type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
+ type ConditionStatus = 'good' | 'minor_damage' | 'major_damage' | 'destroyed';
++type ShorelineSeason = 'dry' | 'wet' | 'normal' | 'transition' | 'unknown';
++type ShorelineBoundaryType = 'baseline' | 'scan' | 'survey';
++type ShorelineSource = 'gee' | 'planet' | 'manual' | 'survey' | 'import';
++type SurveyPlanStatus = 'draft' | 'assigned' | 'in_progress' | 'completed' | 'archived';
+ 
+ interface LoginResponse {
+   accessToken: string;
+@@ -62,6 +66,8 @@ interface TaskRaw {
+   reservoir_name?: string;
+   marker_id?: string | null;
+   marker_code?: string | null;
++  plan_id?: string | null;
++  plan_title?: string | null;
+   assigned_to?: string | null;
+   assigned_to_name?: string | null;
+   title: string;
+@@ -120,6 +126,40 @@ interface ReportPhotoRaw {
+   taken_at: string;
+ }
+ 
++interface ShorelineBoundaryRaw {
++  id: string;
++  reservoir_id: string;
++  boundary_type: ShorelineBoundaryType;
++  season: ShorelineSeason;
++  source: ShorelineSource;
++  capture_date: string | null;
++  area_m2: number | null;
++  is_current: boolean;
++  metadata?: Record<string, unknown> | null;
++  boundary_geojson: {
++    type: 'Polygon';
++    coordinates: number[][][];
++  };
++  created_at: string;
++}
++
++interface SurveyPlanRaw {
++  id: string;
++  reservoir_id: string;
++  reservoir_name?: string;
++  title: string;
++  area: string | null;
++  marker_ids: string[] | null;
++  start_date: string | null;
++  end_date: string | null;
++  lead_user_id: string | null;
++  lead_name?: string | null;
++  checklist: string[] | null;
++  status: SurveyPlanStatus;
++  created_at: string;
++  updated_at: string;
++}
++
+ export interface User {
+   id: string;
+   full_name: string;
+@@ -167,6 +207,8 @@ export interface Task {
+   reservoir_name?: string;
+   marker_id?: string;
+   marker_code?: string;
++  plan_id?: string;
++  plan_title?: string;
+   assigned_to?: string;
+   assigned_to_name?: string;
+   title: string;
+@@ -202,17 +244,81 @@ export interface SatelliteHistory {
+   water_surface_area: number;
+   change_percentage: number;
+   alert_level: string;
++  season?: ShorelineSeason;
++  baseline_area_m2?: number | null;
++  delta_previous_percent?: number | null;
++  compare_mode?: string | null;
++  boundary_id?: string | null;
+   raw_response: {
+-    scene_id: string;
+-    cloud_cover: number;
+-    clear_percent: number;
+-    acquired: string;
+-    pixel_resolution: number;
+-    scenes_found: number;
++    scene_id?: string;
++    cloud_cover?: number;
++    clear_percent?: number;
++    acquired?: string;
++    pixel_resolution?: number;
++    scenes_found?: number;
++    image_id?: string;
+   };
+   created_at: string;
+ }
+ 
++export interface ShorelineBoundary {
++  id: string;
++  reservoir_id: string;
++  boundary_type: ShorelineBoundaryType;
++  season: ShorelineSeason;
++  source: ShorelineSource;
++  capture_date: string | null;
++  area_m2: number | null;
++  is_current: boolean;
++  metadata?: Record<string, unknown> | null;
++  boundary_geojson: {
++    type: 'Polygon';
++    coordinates: number[][][];
++  };
++  created_at: string;
++}
++
++export interface FloodExpansion {
++  boundary_geojson: {
++    type: 'Polygon';
++    coordinates: number[][][];
++  };
++  area_m2: number;
++}
++
++export interface SurveyPlan {
++  id: string;
++  reservoir_id: string;
++  reservoir_name?: string;
++  title: string;
++  area: string | null;
++  marker_ids: string[];
++  start_date: string | null;
++  end_date: string | null;
++  lead_user_id: string | null;
++  lead_name?: string | null;
++  checklist: string[];
++  status: SurveyPlanStatus;
++  created_at: string;
++  updated_at: string;
++}
++
++export interface ReservoirOverview {
++  id: string;
++  name: string;
++  area_ha: number | null;
++  status: ReservoirBackendStatus;
++  markers_total: number;
++  markers_warning: number;
++  tasks_total: number;
++  tasks_pending: number;
++  tasks_in_progress: number;
++  tasks_completed: number;
++  plans_total: number;
++  latest_scan: SatelliteHistory | null;
++  current_boundary: ShorelineBoundary | null;
++}
++
+ export interface TaskReport {
+   id: string;
+   task_id: string;
+@@ -338,6 +444,8 @@ function mapTask(row: TaskRaw): Task {
+     reservoir_name: row.reservoir_name || 'N/A',
+     marker_id: row.marker_id || undefined,
+     marker_code: row.marker_code || undefined,
++    plan_id: row.plan_id || undefined,
++    plan_title: row.plan_title || undefined,
+     assigned_to: row.assigned_to || undefined,
+     assigned_to_name: row.assigned_to_name || 'Chua phan cong',
+     title: row.title,
+@@ -387,6 +495,25 @@ function mapReportPhoto(row: ReportPhotoRaw): ReportPhoto {
+   };
+ }
+ 
++function mapSurveyPlan(row: SurveyPlanRaw): SurveyPlan {
++  return {
++    id: row.id,
++    reservoir_id: row.reservoir_id,
++    reservoir_name: row.reservoir_name,
++    title: row.title,
++    area: row.area,
++    marker_ids: row.marker_ids || [],
++    start_date: row.start_date,
++    end_date: row.end_date,
++    lead_user_id: row.lead_user_id,
++    lead_name: row.lead_name || null,
++    checklist: row.checklist || [],
++    status: row.status,
++    created_at: row.created_at,
++    updated_at: row.updated_at
++  };
++}
++
+ async function loginForDevIfNeeded() {
+   const existing = getToken();
+   if (existing) {
+@@ -787,10 +914,103 @@ export const api = {
+     return request<SatelliteHistory[]>(`/api/satellite/history/${reservoirId}`);
+   },
+ 
+-  triggerSatelliteAnalysis: async (reservoirId: string, date?: string): Promise<any> => {
++  triggerSatelliteAnalysis: async (
++    reservoirId: string,
++    date?: string,
++    mode?: 'auto' | 'gee' | 'planet'
++  ): Promise<any> => {
++    const payload: Record<string, unknown> = {};
++    if (date) {
++      payload.date = date;
++    }
++    if (mode) {
++      payload.mode = mode;
++    }
+     return request(`/api/satellite/analyze/${reservoirId}`, {
+       method: 'POST',
+-      body: JSON.stringify(date ? { date } : {})
++      body: JSON.stringify(payload)
++    });
++  },
++
++  getShorelines: async (
++    reservoirId: string,
++    params?: { season?: ShorelineSeason; type?: ShorelineBoundaryType; current?: boolean }
++  ): Promise<ShorelineBoundary[]> => {
++    const query = new URLSearchParams();
++    if (params?.season) query.set('season', params.season);
++    if (params?.type) query.set('type', params.type);
++    if (params?.current !== undefined) query.set('current', String(params.current));
++    const suffix = query.toString() ? `?${query.toString()}` : '';
++    return request<ShorelineBoundaryRaw[]>(`/api/reservoirs/${reservoirId}/shorelines${suffix}`);
++  },
++
++  createShoreline: async (
++    reservoirId: string,
++    payload: {
++      boundaryGeoJSON: { type: 'Polygon'; coordinates: number[][][] };
++      boundaryType?: ShorelineBoundaryType;
++      season?: ShorelineSeason;
++      source?: ShorelineSource;
++      captureDate?: string;
++      isCurrent?: boolean;
++      metadata?: Record<string, unknown>;
++    }
++  ): Promise<ShorelineBoundary> => {
++    return request<ShorelineBoundaryRaw>(`/api/reservoirs/${reservoirId}/shorelines`, {
++      method: 'POST',
++      body: JSON.stringify(payload)
++    });
++  },
++
++  getFloodExpansion: async (reservoirId: string): Promise<FloodExpansion> => {
++    return request<FloodExpansion>(`/api/reservoirs/${reservoirId}/shorelines/flood-expansion`);
++  },
++
++  getSurveyPlans: async (reservoirId?: string): Promise<SurveyPlan[]> => {
++    const query = reservoirId ? `?reservoirId=${encodeURIComponent(reservoirId)}` : '';
++    const rows = await request<SurveyPlanRaw[]>(`/api/survey-plans${query}`);
++    return rows.map(mapSurveyPlan);
++  },
++
++  createSurveyPlan: async (payload: {
++    reservoirId: string;
++    title: string;
++    area?: string;
++    markerIds?: string[];
++    startDate?: string;
++    endDate?: string;
++    leadUserId?: string;
++    checklist?: string[];
++    status?: SurveyPlanStatus;
++  }): Promise<SurveyPlan> => {
++    const row = await request<SurveyPlanRaw>('/api/survey-plans', {
++      method: 'POST',
++      body: JSON.stringify(payload)
+     });
++    return mapSurveyPlan(row);
++  },
++
++  updateSurveyPlan: async (
++    id: string,
++    payload: {
++      title?: string;
++      area?: string;
++      markerIds?: string[];
++      startDate?: string;
++      endDate?: string;
++      leadUserId?: string | null;
++      checklist?: string[];
++      status?: SurveyPlanStatus;
++    }
++  ): Promise<SurveyPlan> => {
++    const row = await request<SurveyPlanRaw>(`/api/survey-plans/${id}`, {
++      method: 'PATCH',
++      body: JSON.stringify(payload)
++    });
++    return mapSurveyPlan(row);
++  },
++
++  getReservoirOverview: async (reservoirId: string): Promise<ReservoirOverview> => {
++    return request<ReservoirOverview>(`/api/dashboard/reservoir/${reservoirId}`);
+   }
+ };

@@ -6,9 +6,13 @@ const pool = require('../db/pool');
 const validate = require('../middlewares/validate');
 const asyncHandler = require('../utils/asyncHandler');
 const { requireAuth, requireRole } = require('../middlewares/auth');
+const { parseMonthList, determineSeason } = require('../utils/season');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+
+const DEFAULT_WET_MONTHS = [6, 7, 8, 9, 10];
+const DEFAULT_DRY_MONTHS = [11, 12, 1, 2, 3, 4];
 
 function normalizeGeoJsonToPolygon(geojson) {
   if (!geojson) {
@@ -50,6 +54,29 @@ function extractBoundaryInput(req) {
   }
 
   return JSON.stringify(normalizeGeoJsonToPolygon(req.body.boundaryGeoJSON));
+}
+
+function parseBoundaryGeoJson(value) {
+  if (value === undefined || value === null || value === '') {
+    return null;
+  }
+
+  if (typeof value === 'string') {
+    const parsed = JSON.parse(value);
+    return normalizeGeoJsonToPolygon(parsed);
+  }
+
+  return normalizeGeoJsonToPolygon(value);
+}
+
+function resolveSeason(explicitSeason, captureDate) {
+  if (explicitSeason) {
+    return explicitSeason;
+  }
+
+  const wetMonths = parseMonthList(process.env.GEE_WET_MONTHS, DEFAULT_WET_MONTHS);
+  const dryMonths = parseMonthList(process.env.GEE_DRY_MONTHS, DEFAULT_DRY_MONTHS);
+  return determineSeason(captureDate, wetMonths, dryMonths);
 }
 
 /**
@@ -410,6 +437,188 @@ router.delete(
     }
 
     return res.json({ success: true, message: 'Xóa cột mốc thành công' });
+  })
+);
+
+/**
+ * @swagger
+ * /api/reservoirs/{id}/shorelines:
+ *   get:
+ *     tags: [Reservoirs]
+ *     summary: Danh sách ranh giới theo mùa
+ */
+router.get(
+  '/:id/shorelines',
+  requireAuth,
+  [
+    param('id').isUUID(),
+    query('season').optional().isIn(['dry', 'wet', 'normal', 'transition', 'unknown']),
+    query('type').optional().isIn(['baseline', 'scan', 'survey']),
+    query('current').optional().isBoolean()
+  ],
+  validate,
+  asyncHandler(async (req, res) => {
+    const conditions = ['reservoir_id = $1'];
+    const values = [req.params.id];
+
+    if (req.query.season) {
+      values.push(req.query.season);
+      conditions.push(`season = $${values.length}`);
+    }
+
+    if (req.query.type) {
+      values.push(req.query.type);
+      conditions.push(`boundary_type = $${values.length}`);
+    }
+
+    if (req.query.current !== undefined) {
+      values.push(req.query.current === 'true');
+      conditions.push(`is_current = $${values.length}`);
+    }
+
+    const result = await pool.query(
+      `SELECT id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current, metadata,
+              ST_AsGeoJSON(boundary)::json AS boundary_geojson, created_at
+       FROM shoreline_boundaries
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY capture_date DESC NULLS LAST, created_at DESC`,
+      values
+    );
+
+    return res.json({ success: true, data: result.rows });
+  })
+);
+
+/**
+ * @swagger
+ * /api/reservoirs/{id}/shorelines:
+ *   post:
+ *     tags: [Reservoirs]
+ *     summary: Tạo hoặc cập nhật ranh giới theo mùa
+ */
+router.post(
+  '/:id/shorelines',
+  requireAuth,
+  requireRole('admin'),
+  [
+    param('id').isUUID(),
+    body('boundaryGeoJSON').exists(),
+    body('boundaryType').optional().isIn(['baseline', 'scan', 'survey']),
+    body('season').optional().isIn(['dry', 'wet', 'normal', 'transition', 'unknown']),
+    body('source').optional().isIn(['gee', 'planet', 'manual', 'survey', 'import']),
+    body('captureDate').optional().isISO8601(),
+    body('isCurrent').optional().isBoolean(),
+    body('metadata').optional()
+  ],
+  validate,
+  asyncHandler(async (req, res) => {
+    const boundaryType = req.body.boundaryType || 'scan';
+    const captureDate = req.body.captureDate || null;
+    const season = resolveSeason(req.body.season, captureDate);
+    const source = req.body.source || 'manual';
+    const isCurrent = req.body.isCurrent !== undefined ? req.body.isCurrent : boundaryType === 'scan';
+    const metadata = typeof req.body.metadata === 'string' ? JSON.parse(req.body.metadata) : req.body.metadata || null;
+
+    const boundary = parseBoundaryGeoJson(req.body.boundaryGeoJSON);
+    if (!boundary) {
+      return res.status(400).json({ success: false, message: 'Thiếu dữ liệu boundaryGeoJSON' });
+    }
+
+    const boundaryString = JSON.stringify(boundary);
+    const client = await pool.connect();
+
+    try {
+      await client.query('BEGIN');
+
+      if (boundaryType === 'baseline') {
+        await client.query(
+          `DELETE FROM shoreline_boundaries
+           WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2`,
+          [req.params.id, season]
+        );
+      }
+
+      if (isCurrent) {
+        await client.query(
+          `UPDATE shoreline_boundaries
+           SET is_current = FALSE
+           WHERE reservoir_id = $1 AND boundary_type = 'scan' AND is_current = TRUE`,
+          [req.params.id]
+        );
+      }
+
+      const result = await client.query(
+        `INSERT INTO shoreline_boundaries
+          (reservoir_id, boundary_type, season, source, capture_date, area_m2, boundary, is_current, metadata)
+         VALUES
+          ($1, $2, $3, $4, $5,
+           ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($6),4326)::geography),
+           ST_SetSRID(ST_GeomFromGeoJSON($6),4326),
+           $7, $8)
+         RETURNING id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current,
+                   ST_AsGeoJSON(boundary)::json AS boundary_geojson, created_at`,
+        [
+          req.params.id,
+          boundaryType,
+          season,
+          source,
+          captureDate,
+          boundaryString,
+          isCurrent,
+          metadata
+        ]
+      );
+
+      await client.query('COMMIT');
+      return res.status(201).json({ success: true, data: result.rows[0] });
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  })
+);
+
+/**
+ * @swagger
+ * /api/reservoirs/{id}/shorelines/flood-expansion:
+ *   get:
+ *     tags: [Reservoirs]
+ *     summary: Vùng ngập mở rộng (mưa - khô)
+ */
+router.get(
+  '/:id/shorelines/flood-expansion',
+  requireAuth,
+  [param('id').isUUID()],
+  validate,
+  asyncHandler(async (req, res) => {
+    const result = await pool.query(
+      `WITH wet AS (
+         SELECT boundary
+         FROM shoreline_boundaries
+         WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = 'wet'
+         ORDER BY created_at DESC
+         LIMIT 1
+       ),
+       dry AS (
+         SELECT boundary
+         FROM shoreline_boundaries
+         WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = 'dry'
+         ORDER BY created_at DESC
+         LIMIT 1
+       )
+       SELECT ST_AsGeoJSON(ST_Difference(wet.boundary, dry.boundary))::json AS boundary_geojson,
+              ST_Area(ST_Difference(wet.boundary, dry.boundary)::geography) AS area_m2
+       FROM wet, dry`,
+      [req.params.id]
+    );
+
+    if (!result.rowCount || !result.rows[0].boundary_geojson) {
+      return res.status(404).json({ success: false, message: 'Thiếu ranh giới baseline mùa mưa/khô' });
+    }
+
+    return res.json({ success: true, data: result.rows[0] });
   })
 );
 

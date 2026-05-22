@@ -17,6 +17,7 @@ const reportsRoutes = require('./routes/reports.routes');
 const dashboardRoutes = require('./routes/dashboard.routes');
 const notificationsRoutes = require('./routes/notifications.routes');
 const satelliteRoutes = require('./routes/satellite.routes');
+const surveyPlansRoutes = require('./routes/surveyPlans.routes');
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use('/api/reports', reportsRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/notifications', notificationsRoutes);
 app.use('/api/satellite', satelliteRoutes);
+app.use('/api/survey-plans', surveyPlansRoutes);
 
 app.use(errorHandler);
 

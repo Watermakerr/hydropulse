@@ -4,11 +4,11 @@ import 'leaflet/dist/leaflet.css';
 import {
   FileText, MapPin, Plus, ShieldCheck, Trash2, Pencil, Search, Waves, Flag, AlertTriangle,
   ChevronRight, Eye, MapPinOff, CircleDot, X, Upload, Clock, CheckCircle2, XCircle,
-  Satellite, BarChart3, Navigation, Crosshair
+  Satellite, BarChart3, Navigation, Crosshair, ClipboardCheck, Sliders
 } from 'lucide-react';
 import L from 'leaflet';
 import { useSearchParams } from 'react-router-dom';
-import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory, LocationLogRaw } from '../services/api';
+import { api, Marker, ReportPhoto, Reservoir, Task, TaskReport, SatelliteHistory, LocationLogRaw, User, ShorelineBoundary, SurveyPlan, FloodExpansion } from '../services/api';
 
 const SENTINEL2_TILE_URL = (import.meta.env.VITE_SENTINEL2_TILE_URL || '').trim();
 const SENTINEL2_ATTRIBUTION =
@@ -77,6 +77,22 @@ const taskStatusColor: Record<string, { bg: string; text: string }> = {
   in_progress: { bg: 'bg-blue-50', text: 'text-blue-700' },
   completed: { bg: 'bg-emerald-50', text: 'text-emerald-700' },
   cancelled: { bg: 'bg-slate-100', text: 'text-slate-500' }
+};
+
+const planStatusLabel: Record<SurveyPlanForm['status'], string> = {
+  draft: 'Nháp',
+  assigned: 'Đã giao',
+  in_progress: 'Đang thực hiện',
+  completed: 'Hoàn thành',
+  archived: 'Lưu trữ'
+};
+
+const planStatusColor: Record<SurveyPlanForm['status'], { bg: string; text: string }> = {
+  draft: { bg: 'bg-slate-100', text: 'text-slate-600' },
+  assigned: { bg: 'bg-blue-50', text: 'text-blue-700' },
+  in_progress: { bg: 'bg-amber-50', text: 'text-amber-700' },
+  completed: { bg: 'bg-emerald-50', text: 'text-emerald-700' },
+  archived: { bg: 'bg-slate-200', text: 'text-slate-500' }
 };
 
 const taskPriorityVi: Record<string, string> = {
@@ -181,6 +197,25 @@ type MarkerForm = {
   lat: string;
 };
 
+type SurveyPlanForm = {
+  title: string;
+  area: string;
+  markerIds: string[];
+  startDate: string;
+  endDate: string;
+  leadUserId: string;
+  checklistText: string;
+  status: 'draft' | 'assigned' | 'in_progress' | 'completed' | 'archived';
+};
+
+type ShorelineLayerState = {
+  normal: boolean;
+  dry: boolean;
+  wet: boolean;
+  scan: boolean;
+  flood: boolean;
+};
+
 /* ─── Utilities ──────────────────────────────────────────────────── */
 function MapUpdater({ center }: { center: [number, number] }) {
   const map = useMap();
@@ -208,6 +243,21 @@ function pointInPolygon(point: [number, number], polygon: [number, number][]) {
   }
 
   return inside;
+}
+
+function normalizeText(value: string) {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function polygonToLatLng(boundary: { type: 'Polygon'; coordinates: number[][][] }): [number, number][] {
+  if (!boundary || boundary.type !== 'Polygon' || !boundary.coordinates.length) {
+    return [] as [number, number][];
+  }
+
+  return boundary.coordinates[0].map(([lng, lat]) => [lat, lng] as [number, number]);
 }
 
 function MapClickCapture({
@@ -271,10 +321,49 @@ export default function Reservoirs() {
   const [reportDraft, setReportDraft] = useState({ description: '', conditionStatus: 'good' });
   const [satelliteHistory, setSatelliteHistory] = useState<SatelliteHistory[]>([]);
   const [satelliteLoading, setSatelliteLoading] = useState(false);
+  const [shorelines, setShorelines] = useState<ShorelineBoundary[]>([]);
+  const [floodExpansion, setFloodExpansion] = useState<FloodExpansion | null>(null);
+  const [shorelineLoading, setShorelineLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selectedSceneId, setSelectedSceneId] = useState<string | null>(null);
+  const [selectedBoundaryId, setSelectedBoundaryId] = useState<string | null>(null);
+  const [selectedHistoryRecord, setSelectedHistoryRecord] = useState<SatelliteHistory | null>(null);
+  const [comparisonMode, setComparisonMode] = useState<'current' | 'baseline' | 'blend'>('blend');
+  const [comparisonBlend, setComparisonBlend] = useState<number>(0.5);
+  const [showCorridor, setShowCorridor] = useState<boolean>(true);
+
+  const { scanOpacity, baselineOpacity } = useMemo(() => {
+    if (comparisonMode === 'current') return { scanOpacity: 1, baselineOpacity: 0 };
+    if (comparisonMode === 'baseline') return { scanOpacity: 0, baselineOpacity: 1 };
+    return { scanOpacity: comparisonBlend, baselineOpacity: 1 - comparisonBlend };
+  }, [comparisonMode, comparisonBlend]);
+
+  const [surveyPlans, setSurveyPlans] = useState<SurveyPlan[]>([]);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planModalOpen, setPlanModalOpen] = useState(false);
+  const [planSubmitting, setPlanSubmitting] = useState(false);
+  const [planLeads, setPlanLeads] = useState<User[]>([]);
+
+  const [shorelineLayers, setShorelineLayers] = useState<ShorelineLayerState>({
+    normal: true,
+    dry: true,
+    wet: true,
+    scan: true,
+    flood: true
+  });
+
+  const [planForm, setPlanForm] = useState<SurveyPlanForm>({
+    title: '',
+    area: '',
+    markerIds: [],
+    startDate: new Date().toISOString().slice(0, 10),
+    endDate: new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10),
+    leadUserId: '',
+    checklistText: '',
+    status: 'draft'
+  });
 
   const [reservoirModalOpen, setReservoirModalOpen] = useState(false);
   const [reservoirModalMode, setReservoirModalMode] = useState<'create' | 'edit'>('create');
@@ -308,9 +397,37 @@ export default function Reservoirs() {
   const currentTask = useMemo(() => reservoirTasks.find((t) => t.id === selectedTaskId), [reservoirTasks, selectedTaskId]);
   const currentCenter: [number, number] = currentReservoir?.center || [20.825, 105.284];
   const currentBoundary = currentReservoir?.boundary || [];
+  const latestNormalBoundary = useMemo(
+    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'normal'),
+    [shorelines]
+  );
+  const latestDryBoundary = useMemo(
+    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'dry'),
+    [shorelines]
+  );
+  const latestWetBoundary = useMemo(
+    () => shorelines.find((b) => b.boundary_type === 'baseline' && b.season === 'wet'),
+    [shorelines]
+  );
+  const currentScanBoundary = useMemo(
+    () => shorelines.find((b) => b.is_current) || shorelines.find((b) => b.boundary_type === 'scan'),
+    [shorelines]
+  );
+  const highlightedBoundary = useMemo(
+    () => shorelines.find((b) => b.id === selectedBoundaryId) || null,
+    [shorelines, selectedBoundaryId]
+  );
   const sentinelEnabled = Boolean(SENTINEL2_TILE_URL);
   const tileUrl = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_TILE_URL : ESRI_TILE_URL;
   const tileAttribution = baseLayer === 'sentinel2' && sentinelEnabled ? SENTINEL2_ATTRIBUTION : ESRI_ATTRIBUTION;
+
+  const shorelineLayerOptions: { key: keyof ShorelineLayerState; label: string; color: string }[] = [
+    { key: 'normal', label: 'Hiện trạng', color: 'bg-slate-700' },
+    { key: 'dry', label: 'Mùa khô', color: 'bg-amber-500' },
+    { key: 'wet', label: 'Mùa mưa', color: 'bg-blue-500' },
+    { key: 'scan', label: 'Quét mới', color: 'bg-emerald-500' },
+    { key: 'flood', label: 'Ngập mở rộng', color: 'bg-cyan-400' }
+  ];
 
   const currentBounds = useMemo(() => {
     if (!currentBoundary || currentBoundary.length === 0) return null;
@@ -340,7 +457,8 @@ export default function Reservoirs() {
     setReservoirs(rows);
 
     const quickId = searchParams.get('reservoirId');
-    const picked = preferredId || quickId || activeReservoir || rows[0]?.id || '';
+    const hoaBinh = rows.find((r) => normalizeText(r.name).includes('hoa binh'));
+    const picked = preferredId || quickId || activeReservoir || hoaBinh?.id || rows[0]?.id || '';
     if (picked && rows.some((r) => r.id === picked)) {
       setActiveReservoir(picked);
     } else {
@@ -413,6 +531,7 @@ export default function Reservoirs() {
       try {
         setError(null);
         await loadReservoirs();
+        await loadPlanLeads();
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Không thể tải danh sách hồ chứa');
       } finally {
@@ -439,13 +558,78 @@ export default function Reservoirs() {
     }
   };
 
+  const loadShorelines = async (reservoirId: string) => {
+    if (!reservoirId) {
+      setShorelines([]);
+      return;
+    }
+
+    setShorelineLoading(true);
+    try {
+      const rows = await api.getShorelines(reservoirId);
+      setShorelines(rows);
+    } catch (e) {
+      console.error(e);
+      setShorelines([]);
+    } finally {
+      setShorelineLoading(false);
+    }
+  };
+
+  const loadFloodExpansion = async (reservoirId: string) => {
+    if (!reservoirId) {
+      setFloodExpansion(null);
+      return;
+    }
+
+    try {
+      const expansion = await api.getFloodExpansion(reservoirId);
+      setFloodExpansion(expansion);
+    } catch (e) {
+      setFloodExpansion(null);
+    }
+  };
+
+  const loadSurveyPlans = async (reservoirId: string) => {
+    if (!reservoirId) {
+      setSurveyPlans([]);
+      return;
+    }
+
+    setPlanLoading(true);
+    try {
+      const rows = await api.getSurveyPlans(reservoirId);
+      setSurveyPlans(rows);
+    } catch (e) {
+      console.error(e);
+      setSurveyPlans([]);
+    } finally {
+      setPlanLoading(false);
+    }
+  };
+
+  const loadPlanLeads = async () => {
+    try {
+      const users = await api.getUsers();
+      setPlanLeads(users.filter((u) => u.is_active));
+    } catch (e) {
+      setPlanLeads([]);
+    }
+  };
+
   useEffect(() => {
     const run = async () => {
       try {
         setError(null);
+        setSelectedSceneId(null);
+        setSelectedBoundaryId(null);
+        setSelectedHistoryRecord(null);
         await loadMarkers(activeReservoir);
         await loadReservoirTasks(activeReservoir);
         await loadSatelliteHistory(activeReservoir);
+        await loadShorelines(activeReservoir);
+        await loadFloodExpansion(activeReservoir);
+        await loadSurveyPlans(activeReservoir);
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Không thể tải chi tiết hồ');
       }
@@ -727,9 +911,74 @@ export default function Reservoirs() {
   const submitSatelliteAnalysis = async () => {
     if (!activeReservoir) return;
     await withAction(async () => {
-      await api.triggerSatelliteAnalysis(activeReservoir);
+      await api.triggerSatelliteAnalysis(activeReservoir, undefined, 'gee');
       await loadSatelliteHistory(activeReservoir);
+      await loadShorelines(activeReservoir);
+      await loadFloodExpansion(activeReservoir);
     });
+  };
+
+  const resetPlanForm = () => {
+    setPlanForm({
+      title: '',
+      area: '',
+      markerIds: [],
+      startDate: new Date().toISOString().slice(0, 10),
+      endDate: new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10),
+      leadUserId: '',
+      checklistText: '',
+      status: 'draft'
+    });
+  };
+
+  const togglePlanMarker = (markerId: string) => {
+    setPlanForm((prev) => {
+      const exists = prev.markerIds.includes(markerId);
+      return {
+        ...prev,
+        markerIds: exists ? prev.markerIds.filter((id) => id !== markerId) : [...prev.markerIds, markerId]
+      };
+    });
+  };
+
+  const submitSurveyPlan = async () => {
+    if (!activeReservoir) {
+      return;
+    }
+
+    if (!planForm.title.trim()) {
+      setError('Vui lòng nhập tên kế hoạch khảo sát');
+      return;
+    }
+
+    setPlanSubmitting(true);
+    setError(null);
+    try {
+      const checklist = planForm.checklistText
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      await api.createSurveyPlan({
+        reservoirId: activeReservoir,
+        title: planForm.title.trim(),
+        area: planForm.area || undefined,
+        markerIds: planForm.markerIds.length ? planForm.markerIds : undefined,
+        startDate: planForm.startDate || undefined,
+        endDate: planForm.endDate || undefined,
+        leadUserId: planForm.leadUserId || undefined,
+        checklist: checklist.length ? checklist : undefined,
+        status: planForm.status
+      });
+
+      setPlanModalOpen(false);
+      resetPlanForm();
+      await loadSurveyPlans(activeReservoir);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Không thể tạo kế hoạch khảo sát');
+    } finally {
+      setPlanSubmitting(false);
+    }
   };
 
   if (loading) {
@@ -936,7 +1185,102 @@ export default function Reservoirs() {
                   zIndex={10}
                 />
               )}
-              {currentBoundary.length > 0 && <Polygon positions={currentBoundary} pathOptions={{ color: '#003358', fillColor: '#004a7c', fillOpacity: 0.2 }} />}
+              {currentBoundary.length > 0 && shorelineLayers.normal && (
+                <Polygon positions={currentBoundary} pathOptions={{ color: '#003358', fillColor: '#004a7c', fillOpacity: 0.12 }} />
+              )}
+              {/* Protective Corridor Buffer Zone (Hành lang phân đệm bảo vệ) */}
+              {showCorridor && currentBoundary.length > 0 && (
+                <>
+                  {/* Outer soft glow (100m boundary outer belt) */}
+                  <Polygon
+                    positions={currentBoundary}
+                    pathOptions={{
+                      color: '#a855f7',
+                      fillColor: 'transparent',
+                      fillOpacity: 0,
+                      weight: 80,
+                      opacity: 0.15,
+                      lineJoin: 'round',
+                      lineCap: 'round'
+                    }}
+                  />
+                  {/* Middle glow (50m boundary belt) */}
+                  <Polygon
+                    positions={currentBoundary}
+                    pathOptions={{
+                      color: '#d946ef',
+                      fillColor: 'transparent',
+                      fillOpacity: 0,
+                      weight: 40,
+                      opacity: 0.25,
+                      lineJoin: 'round',
+                      lineCap: 'round'
+                    }}
+                  />
+                  {/* Inner neon border */}
+                  <Polygon
+                    positions={currentBoundary}
+                    pathOptions={{
+                      color: '#f472b6',
+                      fillColor: '#a855f7',
+                      fillOpacity: 0.04,
+                      weight: 16,
+                      opacity: 0.45,
+                      lineJoin: 'round',
+                      lineCap: 'round'
+                    }}
+                  />
+                  {/* Core white edge line */}
+                  <Polygon
+                    positions={currentBoundary}
+                    pathOptions={{
+                      color: '#ffffff',
+                      fillColor: 'transparent',
+                      fillOpacity: 0,
+                      weight: 3,
+                      opacity: 0.8,
+                      lineJoin: 'round',
+                      lineCap: 'round'
+                    }}
+                  />
+                </>
+              )}
+              {latestNormalBoundary && shorelineLayers.normal && (
+                <Polygon
+                  positions={polygonToLatLng(latestNormalBoundary.boundary_geojson)}
+                  pathOptions={{ color: '#0f172a', weight: 2, dashArray: '4 6', fillOpacity: 0 }}
+                />
+              )}
+              {latestDryBoundary && shorelineLayers.dry && (
+                <Polygon
+                  positions={polygonToLatLng(latestDryBoundary.boundary_geojson)}
+                  pathOptions={{ color: '#f59e0b', weight: 2.5, fillOpacity: 0.08, fillColor: '#fcd34d' }}
+                />
+              )}
+              {latestWetBoundary && shorelineLayers.wet && (
+                <Polygon
+                  positions={polygonToLatLng(latestWetBoundary.boundary_geojson)}
+                  pathOptions={{ color: '#2563eb', weight: 2.5, fillOpacity: 0.08, fillColor: '#93c5fd' }}
+                />
+              )}
+              {currentScanBoundary && shorelineLayers.scan && (
+                <Polygon
+                  positions={polygonToLatLng(currentScanBoundary.boundary_geojson)}
+                  pathOptions={{ color: '#14b8a6', weight: 3, fillOpacity: 0.05, fillColor: '#5eead4' }}
+                />
+              )}
+              {floodExpansion && shorelineLayers.flood && (
+                <Polygon
+                  positions={polygonToLatLng(floodExpansion.boundary_geojson)}
+                  pathOptions={{ color: '#22d3ee', weight: 2.5, fillOpacity: 0.08, fillColor: '#67e8f9' }}
+                />
+              )}
+              {highlightedBoundary && (
+                <Polygon
+                  positions={polygonToLatLng(highlightedBoundary.boundary_geojson)}
+                  pathOptions={{ color: '#f97316', weight: 4, fillOpacity: 0, dashArray: '2 4' }}
+                />
+              )}
               {markers.map((marker) => (
                 <LeafletMarker
                   key={marker.id}
@@ -967,6 +1311,12 @@ export default function Reservoirs() {
               </div>
             )}
 
+            {shorelineLoading && (
+              <div className="absolute top-14 left-3 bg-white/90 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-on-surface-variant shadow-lg animate-fade-in-up">
+                Đang tải lớp ranh giới...
+              </div>
+            )}
+
             {/* Map Layer Toggle */}
             <div className="absolute top-3 right-3 bg-white/95 backdrop-blur-md px-1.5 py-1.5 rounded-xl text-xs font-bold text-primary shadow-lg flex gap-1">
               <button
@@ -993,9 +1343,51 @@ export default function Reservoirs() {
               </button>
             </div>
 
+            <div className="absolute top-14 right-3 bg-white/95 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-primary shadow-lg space-y-2 w-40">
+              <div className="text-[9px] uppercase tracking-widest text-on-surface-variant">Lớp ranh giới</div>
+              <div className="space-y-1">
+                {shorelineLayerOptions.map((layer) => (
+                  <button
+                    key={layer.key}
+                    className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg transition-colors ${shorelineLayers[layer.key]
+                        ? 'bg-primary/10 text-primary'
+                        : 'text-on-surface-variant hover:bg-surface-container'
+                      }`}
+                    onClick={() =>
+                      setShorelineLayers((prev) => ({
+                        ...prev,
+                        [layer.key]: !prev[layer.key]
+                      }))
+                    }
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className={`w-2 h-2 rounded-full ${layer.color}`}></span>
+                      <span>{layer.label}</span>
+                    </div>
+                    <span>{shorelineLayers[layer.key] ? 'On' : 'Off'}</span>
+                  </button>
+                ))}
+                
+                {/* Hành lang đệm toggle */}
+                <button
+                  className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg transition-colors border-t border-slate-100/50 mt-1 pt-1.5 ${showCorridor
+                      ? 'bg-purple-50 text-purple-700'
+                      : 'text-on-surface-variant hover:bg-surface-container'
+                    }`}
+                  onClick={() => setShowCorridor((prev) => !prev)}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></span>
+                    <span className="font-bold">Hành lang 100m</span>
+                  </div>
+                  <span>{showCorridor ? 'On' : 'Off'}</span>
+                </button>
+              </div>
+            </div>
+
             {/* Map Info Overlay */}
             {currentReservoir && (
-              <div className="absolute bottom-3 left-3 bg-white/90 backdrop-blur-md px-4 py-3 rounded-xl shadow-lg max-w-xs">
+              <div className="absolute bottom-3 left-3 bg-white/90 backdrop-blur-md px-4 py-3 rounded-xl shadow-lg max-w-xs z-[500]">
                 <p className="text-xs font-black text-primary">{currentReservoir.name}</p>
                 <div className="flex gap-3 mt-1">
                   <span className="text-[10px] text-on-surface-variant">
@@ -1007,6 +1399,61 @@ export default function Reservoirs() {
                 </div>
               </div>
             )}
+
+            {/* Map Legend Overlay */}
+            <div className="absolute bottom-3 right-3 bg-white/95 backdrop-blur-md px-3.5 py-3 rounded-xl shadow-lg w-48 z-[500] text-[10px] font-sans border border-slate-100/80 flex flex-col gap-2 animate-fade-in">
+              <div className="font-bold text-[11px] text-primary border-b border-slate-100 pb-1.5 uppercase tracking-wider flex items-center gap-1.5">
+                <span className="w-1.5 h-3 bg-primary rounded-full"></span>
+                Chú thích bản đồ
+              </div>
+              <div className="flex flex-col gap-2 mt-0.5">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 border border-emerald-400 shadow-[0_0_4px_rgba(16,185,129,0.3)]"></span>
+                  <span className="text-on-surface-variant font-semibold">Cột mốc an toàn</span>
+                </div>
+                <div className="flex items-center gap-2.5">
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-500 border border-red-400 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.5)]"></span>
+                  <span className="text-on-surface-variant font-semibold">Cột mốc cảnh báo</span>
+                </div>
+                
+                {shorelineLayers.normal && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <span className="w-4 h-1 border-t-2 border-slate-800"></span>
+                    <span className="text-on-surface-variant font-semibold">Ranh giới hiện trạng</span>
+                  </div>
+                )}
+                {shorelineLayers.dry && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <span className="w-4 h-1 border-t-2 border-[#f59e0b]"></span>
+                    <span className="text-on-surface-variant font-semibold">Ranh giới mùa khô</span>
+                  </div>
+                )}
+                {shorelineLayers.wet && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <span className="w-4 h-1 border-t-2 border-[#2563eb]"></span>
+                    <span className="text-on-surface-variant font-semibold">Ranh giới mùa mưa</span>
+                  </div>
+                )}
+                {shorelineLayers.scan && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <span className="w-4 h-1 border-t-2 border-[#14b8a6]"></span>
+                    <span className="text-on-surface-variant font-semibold">Ranh giới quét mới</span>
+                  </div>
+                )}
+                {shorelineLayers.flood && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <span className="w-4 h-1 border-t-2 border-[#22d3ee]"></span>
+                    <span className="text-on-surface-variant font-semibold">Ngập mở rộng</span>
+                  </div>
+                )}
+                {showCorridor && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <div className="w-4 h-2.5 bg-purple-500/20 border border-purple-500/40 rounded-sm shadow-[0_0_4px_rgba(168,85,247,0.2)]"></div>
+                    <span className="text-on-surface-variant font-semibold">Hành lang đệm (100m)</span>
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
           {/* ── Markers + Detail Panel ────────────────────────────────── */}
@@ -1434,14 +1881,95 @@ export default function Reservoirs() {
             </div>
           </div>
 
+          {/* ── Survey Plans ─────────────────────────────────────────── */}
+          <div className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_4px_16px_rgba(0,51,88,0.04)]">
+            <div className="flex justify-between items-center mb-5">
+              <div>
+                <h3 className="text-base font-black text-primary flex items-center gap-2">
+                  <ClipboardCheck className="w-5 h-5" /> Kế hoạch khảo sát
+                </h3>
+                <p className="text-[11px] text-on-surface-variant mt-1">Lập kế hoạch điều tra cột mốc, theo dõi tiến độ triển khai.</p>
+              </div>
+              <button
+                onClick={() => {
+                  resetPlanForm();
+                  setPlanModalOpen(true);
+                }}
+                disabled={!activeReservoir || planSubmitting}
+                className="px-4 py-2 bg-primary text-white rounded-xl text-xs font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
+              >
+                Tạo kế hoạch
+              </button>
+            </div>
+
+            {planLoading && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[1, 2].map((i) => (
+                  <div key={i} className="h-28 rounded-xl shimmer" />
+                ))}
+              </div>
+            )}
+
+            {!planLoading && surveyPlans.length === 0 && (
+              <div className="py-10 text-center border-2 border-dashed border-slate-200 rounded-xl">
+                <ClipboardCheck className="w-10 h-10 text-on-surface-variant/15 mx-auto mb-3" />
+                <p className="text-sm font-medium text-on-surface-variant">Chưa có kế hoạch khảo sát</p>
+                <p className="text-[11px] text-on-surface-variant/60 mt-1">Bấm "Tạo kế hoạch" để bắt đầu quy trình điều tra</p>
+              </div>
+            )}
+
+            {!planLoading && surveyPlans.length > 0 && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {surveyPlans.map((plan) => {
+                  const pColor = planStatusColor[plan.status];
+                  const planRange = plan.start_date || plan.end_date
+                    ? `${plan.start_date ? new Date(plan.start_date).toLocaleDateString('vi-VN') : 'N/A'} - ${plan.end_date ? new Date(plan.end_date).toLocaleDateString('vi-VN') : 'N/A'}`
+                    : 'Chưa đặt lịch';
+
+                  return (
+                    <div key={plan.id} className="border border-slate-100 rounded-xl p-4 bg-white hover:shadow-sm transition-shadow">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <p className="text-sm font-black text-primary">{plan.title}</p>
+                          <p className="text-[11px] text-on-surface-variant mt-1">{plan.area || 'Chưa ghi khu vực'}</p>
+                        </div>
+                        <span className={`text-[10px] font-black px-2 py-0.5 rounded-full ${pColor.bg} ${pColor.text}`}>
+                          {planStatusLabel[plan.status]}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3 mt-4 text-[11px] text-on-surface-variant">
+                        <div>
+                          <p className="font-semibold text-[10px] uppercase tracking-widest">Thời gian</p>
+                          <p className="mt-1 text-xs text-on-surface">{planRange}</p>
+                        </div>
+                        <div>
+                          <p className="font-semibold text-[10px] uppercase tracking-widest">Phụ trách</p>
+                          <p className="mt-1 text-xs text-on-surface">{plan.lead_name || 'Chưa phân công'}</p>
+                        </div>
+                        <div>
+                          <p className="font-semibold text-[10px] uppercase tracking-widest">Cột mốc</p>
+                          <p className="mt-1 text-xs text-on-surface">{plan.marker_ids.length}</p>
+                        </div>
+                        <div>
+                          <p className="font-semibold text-[10px] uppercase tracking-widest">Checklist</p>
+                          <p className="mt-1 text-xs text-on-surface">{plan.checklist.length}</p>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* ── Satellite Section ─────────────────────────────────────── */}
           <div className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_4px_16px_rgba(0,51,88,0.04)]">
             <div className="flex justify-between items-center mb-5">
               <div>
                 <h3 className="text-base font-black text-primary flex items-center gap-2">
-                  <Satellite className="w-5 h-5" /> Phân tích vệ tinh PlanetScope
+                    <Satellite className="w-5 h-5" /> Phân tích vệ tinh GEE
                 </h3>
-                <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử đánh giá diện tích mặt nước qua ảnh vệ tinh phân giải cao (3m)</p>
+                  <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử quét ảnh theo mùa (mưa/khô) và so sánh với baseline phù hợp</p>
               </div>
               <button
                 onClick={submitSatelliteAnalysis}
@@ -1450,7 +1978,7 @@ export default function Reservoirs() {
                 title="Có thể mất đến 1 phút"
               >
                 <Satellite className="w-3.5 h-3.5" />
-                {working ? 'Đang phân tích...' : 'Quét vệ tinh mới nhất'}
+                  {working ? 'Đang phân tích...' : 'Quét GEE mới nhất'}
               </button>
             </div>
 
@@ -1469,10 +1997,54 @@ export default function Reservoirs() {
 
             {!satelliteLoading && satelliteHistory && satelliteHistory.length > 0 && (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                {satelliteHistory.slice(0, 4).map((record) => (
-                  <div key={record.id} className="border border-slate-100 rounded-xl overflow-hidden bg-white shadow-sm hover:shadow-md transition-all card-hover-lift flex flex-col">
-                    <div className="h-40 bg-slate-100 relative group overflow-hidden cursor-zoom-in" onClick={() => setSelectedSceneId(record.raw_response.scene_id)}>
-                      {record.raw_response?.scene_id ? (
+                {satelliteHistory.slice(0, 4).map((record) => {
+                  const seasonLabel = record.season === 'wet'
+                    ? 'Mùa mưa'
+                    : record.season === 'dry'
+                      ? 'Mùa khô'
+                      : record.season === 'normal'
+                        ? 'Bình thường'
+                        : 'Chuyển mùa';
+                  const compareLabel = record.compare_mode === 'seasonal'
+                    ? 'So với baseline'
+                    : record.compare_mode === 'previous'
+                      ? 'So với lần trước'
+                      : 'Chưa có baseline';
+                  const changeValue = Number(record.change_percentage || 0);
+
+                  return (
+                    <div key={record.id} className="border border-slate-100 rounded-xl overflow-hidden bg-white shadow-sm hover:shadow-md transition-all card-hover-lift flex flex-col">
+                      <div
+                        className="h-40 bg-slate-100 relative group overflow-hidden cursor-pointer"
+                        onClick={() => {
+                          setSelectedHistoryRecord(record);
+                          if (record.boundary_id) {
+                            setSelectedBoundaryId(record.boundary_id);
+                          } else {
+                            setSelectedBoundaryId(null);
+                          }
+                          if (record.raw_response?.scene_id) {
+                            setSelectedSceneId(record.raw_response.scene_id);
+                          } else {
+                            setSelectedSceneId(null);
+                          }
+                        }}
+                      >
+                      {!record.raw_response?.scene_id ? (
+                        <div className="w-full h-full bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 relative flex flex-col items-center justify-center text-center p-4 select-none">
+                          <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:16px_16px] pointer-events-none"></div>
+                          <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse pointer-events-none" style={{ animationDuration: '3s' }}></div>
+                          <div className="relative mb-2">
+                            <Satellite className="w-10 h-10 text-cyan-400 opacity-80 animate-pulse" />
+                            <div className="absolute -inset-1 rounded-full bg-cyan-400/20 blur animate-ping" style={{ animationDuration: '4s' }}></div>
+                          </div>
+                          <span className="text-[10px] font-mono tracking-widest text-cyan-400 uppercase font-black">GEE Sentinel-2</span>
+                          <span className="text-[9px] text-white/50 mt-1">Trích xuất NDWI Tự động</span>
+                          <div className="absolute bottom-2 left-2 bg-cyan-500/25 border border-cyan-400/30 text-cyan-300 px-2 py-0.5 rounded text-[9px] font-bold backdrop-blur-md">
+                            Ảnh GEE / Sentinel-2
+                          </div>
+                        </div>
+                      ) : (
                         <img
                           src={`http://localhost:4000/api/satellite/thumbnail/${record.raw_response.scene_id}`}
                           alt={`Satellite Scene ${record.raw_response.scene_id}`}
@@ -1480,7 +2052,7 @@ export default function Reservoirs() {
                           style={{ filter: 'contrast(1.5) saturate(1.4) brightness(1.1)' }}
                           onError={(e) => { e.currentTarget.style.display = 'none'; (e.currentTarget.nextElementSibling as HTMLElement).style.display = 'flex'; }}
                         />
-                      ) : null}
+                      )}
                       <div className="absolute inset-0 items-center justify-center text-xs text-slate-400 hidden z-0">
                         Không có ảnh
                       </div>
@@ -1491,12 +2063,26 @@ export default function Reservoirs() {
                     </div>
                     <div className="px-3.5 pt-3.5 pb-3 flex-1 flex flex-col">
                       <div className="flex justify-between items-center mb-2">
+                        <span className="text-[10px] font-semibold text-slate-500 uppercase">Mùa</span>
+                        <span className="text-xs font-bold text-slate-700">{seasonLabel}</span>
+                      </div>
+                      <div className="flex justify-between items-center mb-2">
                         <span className="text-[10px] font-semibold text-slate-500 uppercase">Diện tích</span>
                         <span className="text-xs font-black text-primary">{(record.water_surface_area / 10000).toLocaleString(undefined, { maximumFractionDigits: 2 })} ha</span>
                       </div>
                       <div className="flex justify-between items-center mb-2">
                         <span className="text-[10px] font-semibold text-slate-500 uppercase">Mây che phủ</span>
-                        <span className="text-xs font-bold text-slate-700">{(record.raw_response?.cloud_cover * 100).toFixed(1)}%</span>
+                        <span className="text-xs font-bold text-slate-700">
+                          {record.raw_response?.cloud_cover !== undefined
+                            ? `${(record.raw_response.cloud_cover * 100).toFixed(1)}%`
+                            : 'N/A'}
+                        </span>
+                      </div>
+                      <div className="flex justify-between items-center mb-2">
+                        <span className="text-[10px] font-semibold text-slate-500 uppercase">{compareLabel}</span>
+                        <span className={`text-xs font-black ${changeValue >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                          {changeValue.toFixed(1)}%
+                        </span>
                       </div>
                       <div className="flex justify-between items-center mt-auto border-t border-slate-50 pt-2.5">
                         <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-tight">Cảnh báo</span>
@@ -1509,7 +2095,8 @@ export default function Reservoirs() {
                       </div>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
@@ -1517,6 +2104,144 @@ export default function Reservoirs() {
       </div>
 
       {/* ═══ Modals ══════════════════════════════════════════════════ */}
+
+      {/* Survey Plan Modal */}
+      {planModalOpen && (
+        <div className="fixed inset-0 bg-black/30 backdrop-blur-sm z-[110] flex items-center justify-center p-4 animate-overlay-in">
+          <div className="bg-white w-full max-w-3xl rounded-2xl shadow-2xl animate-modal-in">
+            <div className="p-5 border-b border-slate-100 flex justify-between items-center">
+              <div>
+                <h3 className="font-black text-primary text-lg">Tạo kế hoạch khảo sát</h3>
+                <p className="text-[11px] text-on-surface-variant mt-0.5">Thiết lập khu vực, mốc kiểm tra và checklist cho worker.</p>
+              </div>
+              <button onClick={() => setPlanModalOpen(false)} className="p-2 hover:bg-surface-container rounded-lg transition-colors">
+                <X className="w-5 h-5 text-on-surface-variant" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Tên kế hoạch</label>
+                  <input
+                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                    placeholder="VD: Điều tra mốc bờ Tây"
+                    value={planForm.title}
+                    onChange={(e) => setPlanForm({ ...planForm, title: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Trạng thái</label>
+                  <select
+                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                    value={planForm.status}
+                    onChange={(e) => setPlanForm({ ...planForm, status: e.target.value as SurveyPlanForm['status'] })}
+                  >
+                    {(Object.keys(planStatusLabel) as SurveyPlanForm['status'][]).map((status) => (
+                      <option key={status} value={status}>
+                        {planStatusLabel[status]}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold mb-1.5 text-on-surface">Khu vực khảo sát</label>
+                <input
+                  className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                  placeholder="VD: Bờ Bắc - tràn xả"
+                  value={planForm.area}
+                  onChange={(e) => setPlanForm({ ...planForm, area: e.target.value })}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div>
+                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Bắt đầu</label>
+                  <input
+                    type="date"
+                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                    value={planForm.startDate}
+                    onChange={(e) => setPlanForm({ ...planForm, startDate: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Kết thúc</label>
+                  <input
+                    type="date"
+                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                    value={planForm.endDate}
+                    onChange={(e) => setPlanForm({ ...planForm, endDate: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-bold mb-1.5 text-on-surface">Phụ trách</label>
+                  <select
+                    className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all"
+                    value={planForm.leadUserId}
+                    onChange={(e) => setPlanForm({ ...planForm, leadUserId: e.target.value })}
+                  >
+                    <option value="">Chưa phân công</option>
+                    {planLeads.map((user) => (
+                      <option key={user.id} value={user.id}>
+                        {user.full_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold mb-1.5 text-on-surface">Checklist (mỗi dòng 1 mục)</label>
+                <textarea
+                  className="w-full p-3 rounded-xl border border-slate-200 bg-white text-sm focus:border-primary/40 focus:ring-2 focus:ring-primary/10 outline-none transition-all resize-none"
+                  rows={4}
+                  placeholder="Ví dụ:\n- Kiểm tra mốc A1\n- Chụp ảnh hiện trạng"
+                  value={planForm.checklistText}
+                  onChange={(e) => setPlanForm({ ...planForm, checklistText: e.target.value })}
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-bold mb-1.5 text-on-surface">Chọn cột mốc khảo sát</label>
+                <div className="border border-slate-200 rounded-xl p-3 max-h-36 overflow-y-auto space-y-2">
+                  {markers.length === 0 && (
+                    <p className="text-xs text-on-surface-variant">Chưa có cột mốc cho hồ này.</p>
+                  )}
+                  {markers.map((marker) => (
+                    <label key={marker.id} className="flex items-center gap-2 text-xs text-on-surface">
+                      <input
+                        type="checkbox"
+                        checked={planForm.markerIds.includes(marker.id)}
+                        onChange={() => togglePlanMarker(marker.id)}
+                      />
+                      <span className="font-semibold">{marker.code}</span>
+                      <span className="text-on-surface-variant">{marker.name}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <div className="flex gap-3 pt-2">
+                <button
+                  onClick={() => setPlanModalOpen(false)}
+                  className="flex-1 py-3 rounded-xl bg-surface-container text-on-surface text-sm font-bold hover:bg-surface-container-high transition-colors"
+                >
+                  Hủy bỏ
+                </button>
+                <button
+                  onClick={submitSurveyPlan}
+                  disabled={planSubmitting}
+                  className="flex-1 py-3 rounded-xl bg-primary text-white text-sm font-bold hover:bg-primary/90 transition-colors disabled:opacity-50"
+                >
+                  {planSubmitting ? 'Đang tạo...' : 'Tạo kế hoạch'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Reservoir Create/Edit Modal */}
       {reservoirModalOpen && (
@@ -1737,7 +2462,7 @@ export default function Reservoirs() {
       )}
 
       {/* Satellite Fullscreen Viewer */}
-      {selectedSceneId && (
+      {selectedHistoryRecord && (
         <div
           className="fixed inset-0 bg-black/95 backdrop-blur-md z-[1000] flex items-center justify-center cursor-auto animate-overlay-in"
         >
@@ -1760,24 +2485,292 @@ export default function Reservoirs() {
                   <ImageOverlay
                     url={`http://localhost:4000/api/satellite/thumbnail/${selectedSceneId}?width=1536`}
                     bounds={currentBounds}
-                    opacity={1}
+                    opacity={scanOpacity}
                     zIndex={5}
                   />
+                )}
+
+                {/* If it's a GEE/Sentinel-2 scan (no scene_id but has highlighted boundary), we render the extracted water polygon */}
+                {highlightedBoundary && (
+                  <Polygon
+                    positions={polygonToLatLng(highlightedBoundary.boundary_geojson)}
+                    pathOptions={{
+                      color: '#06b6d4',
+                      fillColor: '#22d3ee',
+                      fillOpacity: scanOpacity * 0.4,
+                      weight: 3,
+                      opacity: scanOpacity
+                    }}
+                  />
+                )}
+
+                {/* Also render the seasonal baseline boundary for comparison in GEE mode */}
+                {selectedHistoryRecord.season === 'wet' && latestWetBoundary && (
+                  <Polygon
+                    positions={polygonToLatLng(latestWetBoundary.boundary_geojson)}
+                    pathOptions={{
+                      color: '#2563eb',
+                      fillColor: '#1d4ed8',
+                      fillOpacity: baselineOpacity * 0.45,
+                      weight: 2.5,
+                      opacity: baselineOpacity,
+                      dashArray: comparisonMode === 'blend' ? '5 5' : undefined
+                    }}
+                  />
+                )}
+                {selectedHistoryRecord.season === 'dry' && latestDryBoundary && (
+                  <Polygon
+                    positions={polygonToLatLng(latestDryBoundary.boundary_geojson)}
+                    pathOptions={{
+                      color: '#f59e0b',
+                      fillColor: '#d97706',
+                      fillOpacity: baselineOpacity * 0.45,
+                      weight: 2.5,
+                      opacity: baselineOpacity,
+                      dashArray: comparisonMode === 'blend' ? '5 5' : undefined
+                    }}
+                  />
+                )}
+
+                {/* Glowing Corridor Buffer Zone (Hành lang phân đệm bảo vệ) */}
+                {showCorridor && currentBoundary.length > 0 && (
+                  <>
+                    {/* Outer soft glow (100m boundary outer belt) */}
+                    <Polygon
+                      positions={currentBoundary}
+                      pathOptions={{
+                        color: '#a855f7',
+                        fillColor: 'transparent',
+                        fillOpacity: 0,
+                        weight: 80,
+                        opacity: 0.15,
+                        lineJoin: 'round',
+                        lineCap: 'round'
+                      }}
+                    />
+                    {/* Middle glow (50m boundary belt) */}
+                    <Polygon
+                      positions={currentBoundary}
+                      pathOptions={{
+                        color: '#d946ef',
+                        fillColor: 'transparent',
+                        fillOpacity: 0,
+                        weight: 40,
+                        opacity: 0.25,
+                        lineJoin: 'round',
+                        lineCap: 'round'
+                      }}
+                    />
+                    {/* Inner neon border */}
+                    <Polygon
+                      positions={currentBoundary}
+                      pathOptions={{
+                        color: '#f472b6',
+                        fillColor: '#a855f7',
+                        fillOpacity: 0.04,
+                        weight: 16,
+                        opacity: 0.45,
+                        lineJoin: 'round',
+                        lineCap: 'round'
+                      }}
+                    />
+                    {/* Core white edge line */}
+                    <Polygon
+                      positions={currentBoundary}
+                      pathOptions={{
+                        color: '#ffffff',
+                        fillColor: 'transparent',
+                        fillOpacity: 0,
+                        weight: 3,
+                        opacity: 0.8,
+                        lineJoin: 'round',
+                        lineCap: 'round'
+                      }}
+                    />
+                  </>
                 )}
 
                 {/* Reservoir boundary on top */}
                 {currentBoundary.length > 0 && (
                   <Polygon
                     positions={currentBoundary}
-                    pathOptions={{ color: '#0ea5e9', weight: 3, fillOpacity: 0 }}
+                    pathOptions={{ color: '#0ea5e9', weight: 2, fillOpacity: 0, dashArray: '2 4', opacity: 0.8 }}
                   />
                 )}
               </MapContainer>
+
+              {/* Floating Comparison Control Panel */}
+              <div className="absolute top-6 left-1/2 -translate-x-1/2 bg-slate-900/95 backdrop-blur-md px-6 py-4 rounded-2xl border border-white/10 text-white z-[1010] flex flex-col items-center gap-3 shadow-2xl min-w-[340px] animate-fade-in">
+                <div className="flex items-center gap-2">
+                  <Sliders className="w-4 h-4 text-cyan-400" />
+                  <span className="text-[10px] font-mono tracking-widest text-cyan-400 font-black uppercase">
+                    So sánh ảnh vệ tinh & baseline
+                  </span>
+                </div>
+                
+                <div className="flex bg-white/5 p-1 rounded-xl border border-white/10 w-full">
+                  <button
+                    onClick={() => setComparisonMode('baseline')}
+                    className={`flex-1 text-[11px] font-bold py-2 rounded-lg transition-all ${
+                      comparisonMode === 'baseline'
+                        ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20 font-black'
+                        : 'text-white/70 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    Mẫu Baseline
+                  </button>
+                  <button
+                    onClick={() => setComparisonMode('blend')}
+                    className={`flex-1 text-[11px] font-bold py-2 rounded-lg transition-all ${
+                      comparisonMode === 'blend'
+                        ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20 font-black'
+                        : 'text-white/70 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    Chập ảnh
+                  </button>
+                  <button
+                    onClick={() => setComparisonMode('current')}
+                    className={`flex-1 text-[11px] font-bold py-2 rounded-lg transition-all ${
+                      comparisonMode === 'current'
+                        ? 'bg-cyan-500 text-slate-950 shadow-md shadow-cyan-500/20 font-black'
+                        : 'text-white/70 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    Ảnh quét mới
+                  </button>
+                </div>
+
+                {comparisonMode === 'blend' && (
+                  <div className="w-full space-y-2 mt-1 px-1">
+                    <div className="flex justify-between items-center text-[10px] font-semibold text-white/50">
+                      <span>Baseline ({(100 - comparisonBlend * 100).toFixed(0)}%)</span>
+                      <span>Quét mới ({(comparisonBlend * 100).toFixed(0)}%)</span>
+                    </div>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.01"
+                      value={comparisonBlend}
+                      onChange={(e) => setComparisonBlend(parseFloat(e.target.value))}
+                      className="w-full accent-cyan-400 h-1 bg-white/10 rounded-lg appearance-none cursor-pointer"
+                    />
+                  </div>
+                )}
+
+                {/* Corridor Switch */}
+                <div className="w-full border-t border-white/10 pt-3 mt-1 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2.5 h-2.5 rounded-full bg-purple-500 animate-pulse"></span>
+                    <span className="text-xs font-bold text-slate-200">Hành lang bảo vệ (100m)</span>
+                  </div>
+                  <button
+                    onClick={() => setShowCorridor(prev => !prev)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors focus:outline-none ${
+                      showCorridor ? 'bg-purple-500' : 'bg-white/15'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3 w-3 transform rounded-full bg-white transition-transform ${
+                        showCorridor ? 'translate-x-5' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Floating Information Panel */}
+            <div className="absolute bottom-16 left-16 bg-slate-900/90 backdrop-blur-md p-6 rounded-2xl border border-white/10 text-white z-[1010] max-w-sm space-y-4 shadow-2xl">
+              <div>
+                <span className="text-[10px] font-mono tracking-widest text-cyan-400 uppercase font-black">
+                  {selectedSceneId ? 'Planet API Satellite Scan' : 'GEE Sentinel-2 Analysis'}
+                </span>
+                <h4 className="text-lg font-black text-white mt-1">
+                  {currentReservoir?.name || 'Hồ chứa'}
+                </h4>
+                <p className="text-xs text-white/60 mt-0.5">
+                  Ngày quét: {new Date(selectedHistoryRecord.capture_date).toLocaleDateString('vi-VN')}
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3 border-t border-white/10 pt-4 font-sans">
+                <div>
+                  <span className="text-[9px] font-semibold text-white/50 uppercase">Diện tích trích xuất</span>
+                  <p className="text-base font-black text-cyan-400 mt-0.5">
+                    {(selectedHistoryRecord.water_surface_area / 10000).toLocaleString(undefined, { maximumFractionDigits: 2 })} ha
+                  </p>
+                </div>
+                <div>
+                  <span className="text-[9px] font-semibold text-white/50 uppercase">Chênh lệch</span>
+                  <p className={`text-base font-black mt-0.5 ${Number(selectedHistoryRecord.change_percentage) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                    {Number(selectedHistoryRecord.change_percentage) >= 0 ? '+' : ''}{Number(selectedHistoryRecord.change_percentage).toFixed(2)}%
+                  </p>
+                </div>
+                <div>
+                  <span className="text-[9px] font-semibold text-white/50 uppercase">Phân loại mùa</span>
+                  <p className="text-xs font-bold text-white mt-0.5">
+                    {selectedHistoryRecord.season === 'wet' ? '🟢 Mùa mưa' : selectedHistoryRecord.season === 'dry' ? '🟡 Mùa khô' : '🔵 Bình thường'}
+                  </p>
+                </div>
+                <div>
+                  <span className="text-[9px] font-semibold text-white/50 uppercase">Mức độ cảnh báo</span>
+                  <p className={`text-xs font-black uppercase mt-0.5 ${selectedHistoryRecord.alert_level === 'HIGH' ? 'text-red-400' : selectedHistoryRecord.alert_level === 'MEDIUM' ? 'text-amber-400' : 'text-emerald-400'}`}>
+                    {selectedHistoryRecord.alert_level === 'HIGH' ? 'Cao' : selectedHistoryRecord.alert_level === 'MEDIUM' ? 'Trung bình' : 'Thấp'}
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* Floating Satellite Scan Legend */}
+            <div className="absolute bottom-16 right-16 bg-slate-900/90 backdrop-blur-md p-5 rounded-2xl border border-white/10 text-white z-[1010] w-56 shadow-2xl space-y-3 animate-fade-in font-sans">
+              <div className="font-black text-[10px] text-cyan-400 border-b border-white/10 pb-1.5 uppercase tracking-wider flex items-center gap-1.5">
+                <span className="w-1.5 h-3 bg-cyan-400 rounded-full"></span>
+                Chú thích ranh giới
+              </div>
+              <div className="flex flex-col gap-2.5 text-[10px]">
+                <div className="flex items-center gap-2.5">
+                  <span className="w-4 h-0.5 border-t-2 border-dashed border-[#0ea5e9]"></span>
+                  <span className="text-white/80 font-semibold">Ranh giới hồ pháp lý</span>
+                </div>
+                
+                <div className="flex items-center gap-2.5">
+                  <div className="w-4 h-2.5 bg-[#22d3ee]/25 border border-[#06b6d4] rounded-sm"></div>
+                  <span className="text-white/80 font-semibold">Vùng nước NDWI (Quét mới)</span>
+                </div>
+                
+                {selectedHistoryRecord?.season === 'wet' && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <div className="w-4 h-2.5 bg-[#1d4ed8]/45 border border-[#2563eb] rounded-sm"></div>
+                    <span className="text-white/80 font-semibold">Baseline mùa mưa</span>
+                  </div>
+                )}
+                {selectedHistoryRecord?.season === 'dry' && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <div className="w-4 h-2.5 bg-[#d97706]/45 border border-[#f59e0b] rounded-sm"></div>
+                    <span className="text-white/80 font-semibold">Baseline mùa khô</span>
+                  </div>
+                )}
+                
+                {showCorridor && (
+                  <div className="flex items-center gap-2.5 animate-fade-in">
+                    <div className="w-4 h-2.5 bg-purple-500/20 border border-purple-500/40 rounded-sm shadow-[0_0_6px_rgba(168,85,247,0.3)]"></div>
+                    <span className="text-white/80 font-semibold">Hành lang bảo vệ (100m)</span>
+                  </div>
+                )}
+              </div>
             </div>
 
             <button
               className="absolute top-6 right-6 text-white hover:text-white/80 bg-white/10 hover:bg-white/20 px-4 py-2.5 rounded-xl text-sm font-bold transition-colors z-[1010] flex items-center gap-2"
-              onClick={() => setSelectedSceneId(null)}
+              onClick={() => {
+                setSelectedHistoryRecord(null);
+                setSelectedSceneId(null);
+                setSelectedBoundaryId(null);
+                setComparisonMode('blend');
+                setComparisonBlend(0.5);
+              }}
             >
               <X className="w-4 h-4" /> Đóng
             </button>

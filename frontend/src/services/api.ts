@@ -5,6 +5,10 @@ type MarkerStatus = 'normal' | 'damaged' | 'missing' | 'needs_inspection';
 type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'cancelled';
 type TaskPriority = 'low' | 'medium' | 'high' | 'urgent';
 type ConditionStatus = 'good' | 'minor_damage' | 'major_damage' | 'destroyed';
+type ShorelineSeason = 'dry' | 'wet' | 'normal' | 'transition' | 'unknown';
+type ShorelineBoundaryType = 'baseline' | 'scan' | 'survey';
+type ShorelineSource = 'gee' | 'planet' | 'manual' | 'survey' | 'import';
+type SurveyPlanStatus = 'draft' | 'assigned' | 'in_progress' | 'completed' | 'archived';
 
 interface LoginResponse {
   accessToken: string;
@@ -62,6 +66,8 @@ interface TaskRaw {
   reservoir_name?: string;
   marker_id?: string | null;
   marker_code?: string | null;
+  plan_id?: string | null;
+  plan_title?: string | null;
   assigned_to?: string | null;
   assigned_to_name?: string | null;
   title: string;
@@ -120,6 +126,40 @@ interface ReportPhotoRaw {
   taken_at: string;
 }
 
+interface ShorelineBoundaryRaw {
+  id: string;
+  reservoir_id: string;
+  boundary_type: ShorelineBoundaryType;
+  season: ShorelineSeason;
+  source: ShorelineSource;
+  capture_date: string | null;
+  area_m2: number | null;
+  is_current: boolean;
+  metadata?: Record<string, unknown> | null;
+  boundary_geojson: {
+    type: 'Polygon';
+    coordinates: number[][][];
+  };
+  created_at: string;
+}
+
+interface SurveyPlanRaw {
+  id: string;
+  reservoir_id: string;
+  reservoir_name?: string;
+  title: string;
+  area: string | null;
+  marker_ids: string[] | null;
+  start_date: string | null;
+  end_date: string | null;
+  lead_user_id: string | null;
+  lead_name?: string | null;
+  checklist: string[] | null;
+  status: SurveyPlanStatus;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface User {
   id: string;
   full_name: string;
@@ -167,6 +207,8 @@ export interface Task {
   reservoir_name?: string;
   marker_id?: string;
   marker_code?: string;
+  plan_id?: string;
+  plan_title?: string;
   assigned_to?: string;
   assigned_to_name?: string;
   title: string;
@@ -202,15 +244,79 @@ export interface SatelliteHistory {
   water_surface_area: number;
   change_percentage: number;
   alert_level: string;
+  season?: ShorelineSeason;
+  baseline_area_m2?: number | null;
+  delta_previous_percent?: number | null;
+  compare_mode?: string | null;
+  boundary_id?: string | null;
   raw_response: {
-    scene_id: string;
-    cloud_cover: number;
-    clear_percent: number;
-    acquired: string;
-    pixel_resolution: number;
-    scenes_found: number;
+    scene_id?: string;
+    cloud_cover?: number;
+    clear_percent?: number;
+    acquired?: string;
+    pixel_resolution?: number;
+    scenes_found?: number;
+    image_id?: string;
   };
   created_at: string;
+}
+
+export interface ShorelineBoundary {
+  id: string;
+  reservoir_id: string;
+  boundary_type: ShorelineBoundaryType;
+  season: ShorelineSeason;
+  source: ShorelineSource;
+  capture_date: string | null;
+  area_m2: number | null;
+  is_current: boolean;
+  metadata?: Record<string, unknown> | null;
+  boundary_geojson: {
+    type: 'Polygon';
+    coordinates: number[][][];
+  };
+  created_at: string;
+}
+
+export interface FloodExpansion {
+  boundary_geojson: {
+    type: 'Polygon';
+    coordinates: number[][][];
+  };
+  area_m2: number;
+}
+
+export interface SurveyPlan {
+  id: string;
+  reservoir_id: string;
+  reservoir_name?: string;
+  title: string;
+  area: string | null;
+  marker_ids: string[];
+  start_date: string | null;
+  end_date: string | null;
+  lead_user_id: string | null;
+  lead_name?: string | null;
+  checklist: string[];
+  status: SurveyPlanStatus;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ReservoirOverview {
+  id: string;
+  name: string;
+  area_ha: number | null;
+  status: ReservoirBackendStatus;
+  markers_total: number;
+  markers_warning: number;
+  tasks_total: number;
+  tasks_pending: number;
+  tasks_in_progress: number;
+  tasks_completed: number;
+  plans_total: number;
+  latest_scan: SatelliteHistory | null;
+  current_boundary: ShorelineBoundary | null;
 }
 
 export interface TaskReport {
@@ -338,6 +444,8 @@ function mapTask(row: TaskRaw): Task {
     reservoir_name: row.reservoir_name || 'N/A',
     marker_id: row.marker_id || undefined,
     marker_code: row.marker_code || undefined,
+    plan_id: row.plan_id || undefined,
+    plan_title: row.plan_title || undefined,
     assigned_to: row.assigned_to || undefined,
     assigned_to_name: row.assigned_to_name || 'Chua phan cong',
     title: row.title,
@@ -384,6 +492,25 @@ function mapReportPhoto(row: ReportPhotoRaw): ReportPhoto {
       size: row.metadata?.size || 0
     },
     taken_at: row.taken_at
+  };
+}
+
+function mapSurveyPlan(row: SurveyPlanRaw): SurveyPlan {
+  return {
+    id: row.id,
+    reservoir_id: row.reservoir_id,
+    reservoir_name: row.reservoir_name,
+    title: row.title,
+    area: row.area,
+    marker_ids: row.marker_ids || [],
+    start_date: row.start_date,
+    end_date: row.end_date,
+    lead_user_id: row.lead_user_id,
+    lead_name: row.lead_name || null,
+    checklist: row.checklist || [],
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at
   };
 }
 
@@ -687,6 +814,7 @@ export const api = {
   createTask: async (payload: {
     reservoirId: string;
     markerId?: string;
+    planId?: string;
     assignedTo?: string;
     title: string;
     description?: string;
@@ -787,10 +915,103 @@ export const api = {
     return request<SatelliteHistory[]>(`/api/satellite/history/${reservoirId}`);
   },
 
-  triggerSatelliteAnalysis: async (reservoirId: string, date?: string): Promise<any> => {
+  triggerSatelliteAnalysis: async (
+    reservoirId: string,
+    date?: string,
+    mode?: 'auto' | 'gee' | 'planet'
+  ): Promise<any> => {
+    const payload: Record<string, unknown> = {};
+    if (date) {
+      payload.date = date;
+    }
+    if (mode) {
+      payload.mode = mode;
+    }
     return request(`/api/satellite/analyze/${reservoirId}`, {
       method: 'POST',
-      body: JSON.stringify(date ? { date } : {})
+      body: JSON.stringify(payload)
     });
+  },
+
+  getShorelines: async (
+    reservoirId: string,
+    params?: { season?: ShorelineSeason; type?: ShorelineBoundaryType; current?: boolean }
+  ): Promise<ShorelineBoundary[]> => {
+    const query = new URLSearchParams();
+    if (params?.season) query.set('season', params.season);
+    if (params?.type) query.set('type', params.type);
+    if (params?.current !== undefined) query.set('current', String(params.current));
+    const suffix = query.toString() ? `?${query.toString()}` : '';
+    return request<ShorelineBoundaryRaw[]>(`/api/reservoirs/${reservoirId}/shorelines${suffix}`);
+  },
+
+  createShoreline: async (
+    reservoirId: string,
+    payload: {
+      boundaryGeoJSON: { type: 'Polygon'; coordinates: number[][][] };
+      boundaryType?: ShorelineBoundaryType;
+      season?: ShorelineSeason;
+      source?: ShorelineSource;
+      captureDate?: string;
+      isCurrent?: boolean;
+      metadata?: Record<string, unknown>;
+    }
+  ): Promise<ShorelineBoundary> => {
+    return request<ShorelineBoundaryRaw>(`/api/reservoirs/${reservoirId}/shorelines`, {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+  },
+
+  getFloodExpansion: async (reservoirId: string): Promise<FloodExpansion> => {
+    return request<FloodExpansion>(`/api/reservoirs/${reservoirId}/shorelines/flood-expansion`);
+  },
+
+  getSurveyPlans: async (reservoirId?: string): Promise<SurveyPlan[]> => {
+    const query = reservoirId ? `?reservoirId=${encodeURIComponent(reservoirId)}` : '';
+    const rows = await request<SurveyPlanRaw[]>(`/api/survey-plans${query}`);
+    return rows.map(mapSurveyPlan);
+  },
+
+  createSurveyPlan: async (payload: {
+    reservoirId: string;
+    title: string;
+    area?: string;
+    markerIds?: string[];
+    startDate?: string;
+    endDate?: string;
+    leadUserId?: string;
+    checklist?: string[];
+    status?: SurveyPlanStatus;
+  }): Promise<SurveyPlan> => {
+    const row = await request<SurveyPlanRaw>('/api/survey-plans', {
+      method: 'POST',
+      body: JSON.stringify(payload)
+    });
+    return mapSurveyPlan(row);
+  },
+
+  updateSurveyPlan: async (
+    id: string,
+    payload: {
+      title?: string;
+      area?: string;
+      markerIds?: string[];
+      startDate?: string;
+      endDate?: string;
+      leadUserId?: string | null;
+      checklist?: string[];
+      status?: SurveyPlanStatus;
+    }
+  ): Promise<SurveyPlan> => {
+    const row = await request<SurveyPlanRaw>(`/api/survey-plans/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(payload)
+    });
+    return mapSurveyPlan(row);
+  },
+
+  getReservoirOverview: async (reservoirId: string): Promise<ReservoirOverview> => {
+    return request<ReservoirOverview>(`/api/dashboard/reservoir/${reservoirId}`);
   }
 };

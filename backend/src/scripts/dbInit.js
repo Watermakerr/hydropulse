@@ -11,11 +11,13 @@ async function runSqlFile(fileName) {
 }
 
 async function main() {
-  await runSqlFile('001_init.sql');
+  const sqlDir = path.join(__dirname, '../../sql');
+  const files = fs.readdirSync(sqlDir)
+    .filter(file => file.endsWith('.sql'))
+    .sort();
 
-  const migration2 = path.join(__dirname, '../../sql/002_add_supporting_indexes.sql');
-  if (fs.existsSync(migration2)) {
-    await runSqlFile('002_add_supporting_indexes.sql');
+  for (const file of files) {
+    await runSqlFile(file);
   }
 
   await pool.end();

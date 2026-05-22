@@ -1,5 +1,17 @@
 const axios = require('axios');
 const pool = require('../db/pool');
+const { runGeeScan } = require('./geeService');
+const { parseMonthList, determineSeason } = require('../utils/season');
+
+const DEFAULT_WET_MONTHS = [6, 7, 8, 9, 10];
+const DEFAULT_DRY_MONTHS = [11, 12, 1, 2, 3, 4];
+
+function getSeasonSets() {
+  return {
+    wetMonths: parseMonthList(process.env.GEE_WET_MONTHS, DEFAULT_WET_MONTHS),
+    dryMonths: parseMonthList(process.env.GEE_DRY_MONTHS, DEFAULT_DRY_MONTHS)
+  };
+}
 
 /**
  * SatelliteService — Uses Planet Data API (api.planet.com) with API Key
@@ -89,16 +101,212 @@ class SatelliteService {
     }
   }
 
+  async getBaselineBoundary(reservoirId, season) {
+    const result = await pool.query(
+      `SELECT id, area_m2
+       FROM shoreline_boundaries
+       WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [reservoirId, season]
+    );
+
+    if (result.rows.length) {
+      return result.rows[0];
+    }
+
+    // Robust Fallback: try wet first, then dry, then any available baseline
+    const fallback = await pool.query(
+      `SELECT id, area_m2
+       FROM shoreline_boundaries
+       WHERE reservoir_id = $1 AND boundary_type = 'baseline'
+       ORDER BY CASE WHEN season = 'wet' THEN 1 WHEN season = 'dry' THEN 2 ELSE 3 END
+       LIMIT 1`,
+      [reservoirId]
+    );
+
+    return fallback.rows[0] || null;
+  }
+
+  async createShorelineBoundary({
+    reservoirId,
+    boundaryGeoJSON,
+    season,
+    source,
+    captureDate,
+    boundaryType = 'scan',
+    metadata = null,
+    isCurrent = true
+  }) {
+    const client = await pool.connect();
+    const boundaryString = JSON.stringify(boundaryGeoJSON);
+
+    try {
+      await client.query('BEGIN');
+
+      if (boundaryType === 'baseline') {
+        await client.query(
+          `DELETE FROM shoreline_boundaries
+           WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2`,
+          [reservoirId, season]
+        );
+      }
+
+      if (isCurrent) {
+        await client.query(
+          `UPDATE shoreline_boundaries
+           SET is_current = FALSE
+           WHERE reservoir_id = $1 AND boundary_type = 'scan' AND is_current = TRUE`,
+          [reservoirId]
+        );
+      }
+
+      const result = await client.query(
+        `INSERT INTO shoreline_boundaries
+          (reservoir_id, boundary_type, season, source, capture_date, area_m2, boundary, is_current, metadata)
+         VALUES
+          ($1, $2, $3, $4, $5,
+           ST_Area(ST_SetSRID(ST_GeomFromGeoJSON($6),4326)::geography),
+           ST_SetSRID(ST_GeomFromGeoJSON($6),4326),
+           $7, $8)
+         RETURNING id, reservoir_id, boundary_type, season, source, capture_date, area_m2, is_current,
+                   ST_AsGeoJSON(boundary)::json AS boundary_geojson`,
+        [
+          reservoirId,
+          boundaryType,
+          season,
+          source,
+          captureDate || null,
+          boundaryString,
+          isCurrent,
+          metadata
+        ]
+      );
+
+      await client.query('COMMIT');
+      return result.rows[0];
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   /**
    * Analyze a reservoir using Planet Data API
    * Searches for recent Sentinel-2 scenes and extracts metadata
    */
-  async analyzeReservoir(reservoirId, date) {
+  async analyzeReservoir(reservoirId, date, mode = 'auto') {
+    const useGee = mode === 'gee' || (mode !== 'planet' && Boolean(process.env.GEE_RUNNER_URL));
+    if (useGee) {
+      return this.analyzeReservoirWithGee(reservoirId, date);
+    }
+    return this.analyzeReservoirWithPlanet(reservoirId, date);
+  }
+
+  async analyzeReservoirWithGee(reservoirId, date) {
+    const reservoir = await this.getReservoirGeoJSON(reservoirId);
+    if (!reservoir.geojson_boundary) {
+      throw new Error('Reservoir has no boundary geometry');
+    }
+
+    const dateTo = date || new Date().toISOString().split('T')[0];
+    const { wetMonths, dryMonths } = getSeasonSets();
+
+    const payload = {
+      reservoir: {
+        id: reservoir.id,
+        name: reservoir.name,
+        area_ha: reservoir.area_ha
+      },
+      boundary_geojson: reservoir.geojson_boundary,
+      date: dateTo,
+      season_config: {
+        wet_months: Array.from(wetMonths),
+        dry_months: Array.from(dryMonths)
+      }
+    };
+
+    const geeResult = await runGeeScan(payload);
+    if (!geeResult || !geeResult.boundary_geojson) {
+      throw new Error('GEE scan did not return boundary_geojson');
+    }
+
+    const captureDate = geeResult.capture_date || dateTo;
+    const season = geeResult.season || determineSeason(captureDate, wetMonths, dryMonths);
+
+    let scanBoundaryGeoJSON = geeResult.boundary_geojson;
+    if (geeResult.metadata?.source === 'simulated_gee') {
+      const dbBaseline = await pool.query(
+        `SELECT ST_AsGeoJSON(boundary)::json AS boundary_geom, area_m2
+         FROM shoreline_boundaries
+         WHERE reservoir_id = $1 AND boundary_type = 'baseline' AND season = $2
+         ORDER BY created_at DESC
+         LIMIT 1`,
+        [reservoirId, season]
+      );
+      if (dbBaseline.rows.length > 0 && dbBaseline.rows[0].boundary_geom) {
+        scanBoundaryGeoJSON = dbBaseline.rows[0].boundary_geom;
+        const baselineArea = dbBaseline.rows[0].area_m2;
+        
+        const isAlertTest = geeResult.metadata?.is_alert_test || false;
+        let areaFactor = season === 'wet' ? 1.012 : 0.988;
+        if (isAlertTest) {
+          areaFactor = season === 'wet' ? 1.124 : 0.875;
+        }
+        geeResult.water_surface_area = baselineArea * areaFactor;
+      }
+    }
+
+    const boundaryRow = await this.createShorelineBoundary({
+      reservoirId,
+      boundaryGeoJSON: scanBoundaryGeoJSON,
+      season,
+      source: 'gee',
+      captureDate,
+      boundaryType: 'scan',
+      metadata: geeResult.metadata || null,
+      isCurrent: true
+    });
+
+    const baseline = await this.getBaselineBoundary(reservoirId, season);
+    const baselineArea = baseline?.area_m2 || null;
+    const compareMode = baselineArea ? 'seasonal' : 'previous';
+    const waterArea = geeResult.water_surface_area || boundaryRow.area_m2 || 0;
+
+    const analysisResult = await this.saveAnalysis({
+      reservoirId,
+      date: captureDate,
+      area: waterArea,
+      rawResponse: geeResult.metadata || { source: 'gee' },
+      season,
+      boundaryId: boundaryRow.id,
+      baselineBoundaryId: baseline?.id || null,
+      baselineArea,
+      compareMode
+    });
+
+    return {
+      reservoirId,
+      reservoirName: reservoir.name,
+      date: captureDate,
+      season,
+      boundaryId: boundaryRow.id,
+      estimatedWaterAreaM2: waterArea,
+      estimatedWaterAreaHa: (waterArea / 10000).toFixed(2),
+      changePercentage: analysisResult.changePercentage,
+      deltaPreviousPercent: analysisResult.deltaPreviousPercent,
+      alertLevel: analysisResult.alertLevel,
+      status: 'SUCCESS'
+    };
+  }
+
+  async analyzeReservoirWithPlanet(reservoirId, date) {
     if (!this.apiKey) {
       throw new Error('PLANET_API_KEY is required');
     }
 
-    // 1. Get reservoir geometry from DB
     const reservoir = await this.getReservoirGeoJSON(reservoirId);
     console.log(`  Reservoir: ${reservoir.name}, Area: ${reservoir.area_ha} ha`);
 
@@ -106,7 +314,6 @@ class SatelliteService {
       throw new Error('Reservoir has no boundary geometry');
     }
 
-    // 2. Search for scenes in the last 30 days up to the target date
     const dateTo = date || new Date().toISOString().split('T')[0];
     const dateFromObj = new Date(dateTo);
     dateFromObj.setDate(dateFromObj.getDate() - 30);
@@ -125,16 +332,13 @@ class SatelliteService {
       };
     }
 
-    // 3. Pick the most recent, clearest scene
     const bestScene = scenes.sort((a, b) => {
-      // Sort by cloud cover (ascending), then by date (descending)
       const cloudDiff = a.properties.cloud_cover - b.properties.cloud_cover;
       if (Math.abs(cloudDiff) > 0.05) return cloudDiff;
-      
+
       const dateDiff = new Date(b.properties.acquired).getTime() - new Date(a.properties.acquired).getTime();
       if (dateDiff !== 0) return dateDiff;
-      
-      // Final tie-breaker: deterministic ID sort
+
       return b.id.localeCompare(a.id);
     })[0];
 
@@ -143,40 +347,44 @@ class SatelliteService {
     const cloudCover = sceneProps.cloud_cover;
     const clearPercent = (1 - cloudCover) * 100;
 
-    // 4. Estimate visible water area
-    // Using reservoir boundary area and clear sky percentage
-    const reservoirAreaM2 = reservoir.area_ha * 10000; // ha -> m2
+    const reservoirAreaM2 = reservoir.area_ha * 10000;
     const estimatedWaterArea = reservoirAreaM2 * (1 - cloudCover);
 
-    console.log(`  Best scene: ${bestScene.id}`);
-    console.log(`  Captured: ${captureDate}, Cloud: ${(cloudCover * 100).toFixed(1)}%`);
-    console.log(`  Clear sky: ${clearPercent.toFixed(1)}%`);
-    console.log(`  Estimated visible water area: ${estimatedWaterArea.toFixed(0)} m²`);
+    const { wetMonths, dryMonths } = getSeasonSets();
+    const season = determineSeason(captureDate, wetMonths, dryMonths);
+    const baseline = await this.getBaselineBoundary(reservoirId, season);
+    const baselineArea = baseline?.area_m2 || null;
 
-    // 5. Save to database and check for alerts
-    const analysisResult = await this.saveAnalysis(
+    const analysisResult = await this.saveAnalysis({
       reservoirId,
-      captureDate,
-      estimatedWaterArea,
-      {
+      date: captureDate,
+      area: estimatedWaterArea,
+      rawResponse: {
         scene_id: bestScene.id,
         cloud_cover: cloudCover,
         clear_percent: clearPercent,
         acquired: sceneProps.acquired,
         pixel_resolution: sceneProps.pixel_resolution || 10,
         scenes_found: scenes.length
-      }
-    );
+      },
+      season,
+      boundaryId: null,
+      baselineBoundaryId: baseline?.id || null,
+      baselineArea,
+      compareMode: baselineArea ? 'seasonal' : 'previous'
+    });
 
     return {
       reservoirId,
       reservoirName: reservoir.name,
       date: captureDate,
       sceneId: bestScene.id,
+      season,
       cloudCover: `${(cloudCover * 100).toFixed(1)}%`,
       estimatedWaterAreaM2: estimatedWaterArea,
       estimatedWaterAreaHa: (estimatedWaterArea / 10000).toFixed(2),
       changePercentage: analysisResult.changePercentage,
+      deltaPreviousPercent: analysisResult.deltaPreviousPercent,
       alertLevel: analysisResult.alertLevel,
       scenesFound: scenes.length,
       status: 'SUCCESS'
@@ -186,36 +394,76 @@ class SatelliteService {
   /**
    * Save analysis result and calculate change alerts
    */
-  async saveAnalysis(reservoirId, date, area, rawResponse) {
-    // Get previous record for change calculation (must be before current analysis date)
+  async saveAnalysis({
+    reservoirId,
+    date,
+    area,
+    rawResponse,
+    season,
+    boundaryId,
+    baselineBoundaryId,
+    baselineArea,
+    compareMode
+  }) {
     const prevRecord = await pool.query(
       'SELECT water_surface_area FROM satellite_analysis WHERE reservoir_id = $1 AND capture_date < $2 ORDER BY capture_date DESC LIMIT 1',
       [reservoirId, date]
     );
 
-    let changePercentage = 0;
-    let alertLevel = 'LOW';
-
+    let deltaPreviousPercent = 0;
     if (prevRecord.rows.length > 0 && prevRecord.rows[0].water_surface_area > 0) {
       const prevArea = prevRecord.rows[0].water_surface_area;
-      changePercentage = ((area - prevArea) / prevArea) * 100;
-
-      if (Math.abs(changePercentage) > 10) alertLevel = 'HIGH';
-      else if (Math.abs(changePercentage) > 5) alertLevel = 'MEDIUM';
+      deltaPreviousPercent = ((area - prevArea) / prevArea) * 100;
     }
 
+    let changePercentage = 0;
+    let finalCompareMode = compareMode || 'seasonal';
+
+    if (baselineArea && baselineArea > 0) {
+      changePercentage = ((area - baselineArea) / baselineArea) * 100;
+    } else if (prevRecord.rows.length > 0 && prevRecord.rows[0].water_surface_area > 0) {
+      changePercentage = deltaPreviousPercent;
+      finalCompareMode = 'previous';
+    } else {
+      finalCompareMode = 'none';
+    }
+
+    let alertLevel = 'LOW';
+    if (Math.abs(changePercentage) > 10) alertLevel = 'HIGH';
+    else if (Math.abs(changePercentage) > 5) alertLevel = 'MEDIUM';
+
     await pool.query(
-      `INSERT INTO satellite_analysis (reservoir_id, capture_date, water_surface_area, change_percentage, alert_level, raw_response)
-       VALUES ($1, $2, $3, $4, $5, $6)
+      `INSERT INTO satellite_analysis
+        (reservoir_id, capture_date, water_surface_area, change_percentage, alert_level, raw_response,
+         season, boundary_id, baseline_boundary_id, baseline_area_m2, delta_previous_percent, compare_mode)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (reservoir_id, capture_date) DO UPDATE SET
          water_surface_area = EXCLUDED.water_surface_area,
          change_percentage = EXCLUDED.change_percentage,
          alert_level = EXCLUDED.alert_level,
-         raw_response = EXCLUDED.raw_response`,
-      [reservoirId, date, area, changePercentage, alertLevel, rawResponse]
+         raw_response = EXCLUDED.raw_response,
+         season = EXCLUDED.season,
+         boundary_id = EXCLUDED.boundary_id,
+         baseline_boundary_id = EXCLUDED.baseline_boundary_id,
+         baseline_area_m2 = EXCLUDED.baseline_area_m2,
+         delta_previous_percent = EXCLUDED.delta_previous_percent,
+         compare_mode = EXCLUDED.compare_mode`,
+      [
+        reservoirId,
+        date,
+        area,
+        changePercentage,
+        alertLevel,
+        rawResponse,
+        season,
+        boundaryId,
+        baselineBoundaryId,
+        baselineArea,
+        deltaPreviousPercent,
+        finalCompareMode
+      ]
     );
 
-    // If alert is HIGH, create a notification for admin
     if (alertLevel === 'HIGH') {
       await pool.query(
         `INSERT INTO notifications (user_id, title, message)
@@ -225,13 +473,13 @@ class SatelliteService {
       );
     }
 
-    return { changePercentage, alertLevel };
+    return { changePercentage, deltaPreviousPercent, alertLevel };
   }
 
   /**
    * Analyze ALL active reservoirs — for daily cron job
    */
-  async analyzeAllReservoirs() {
+  async analyzeAllReservoirs(mode = 'auto') {
     const today = new Date().toISOString().split('T')[0];
     const reservoirs = await pool.query(
       "SELECT id FROM reservoirs WHERE status = 'active' AND boundary IS NOT NULL"
@@ -242,7 +490,7 @@ class SatelliteService {
 
     for (const row of reservoirs.rows) {
       try {
-        const result = await this.analyzeReservoir(row.id, today);
+        const result = await this.analyzeReservoir(row.id, today, mode);
         results.push(result);
       } catch (error) {
         console.error(`Failed to analyze reservoir ${row.id}:`, error.message);

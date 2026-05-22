@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Calendar, CheckCircle2, PlusCircle, X } from 'lucide-react';
-import { api, Marker, Reservoir, Task, User } from '../services/api';
+import { api, Marker, Reservoir, Task, User, SurveyPlan } from '../services/api';
 
 type TaskForm = {
   title: string;
@@ -8,6 +8,7 @@ type TaskForm = {
   template: string;
   reservoirId: string;
   markerId: string;
+  planId: string;
   assignedTo: string;
   priority: 'low' | 'medium' | 'high' | 'urgent';
   dueDate: string;
@@ -27,6 +28,7 @@ const initialForm: TaskForm = {
   template: taskTemplates[0].value,
   reservoirId: '',
   markerId: '',
+  planId: '',
   assignedTo: '',
   priority: 'medium',
   dueDate: new Date(Date.now() + 3 * 86400000).toISOString().slice(0, 10)
@@ -38,6 +40,7 @@ export default function TaskManagement() {
   const [reservoirs, setReservoirs] = useState<Reservoir[]>([]);
   const [markers, setMarkers] = useState<Marker[]>([]);
   const [workers, setWorkers] = useState<User[]>([]);
+  const [surveyPlans, setSurveyPlans] = useState<SurveyPlan[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -65,6 +68,21 @@ export default function TaskManagement() {
     });
   };
 
+  const loadPlans = async (reservoirId: string) => {
+    if (!reservoirId) {
+      setSurveyPlans([]);
+      setForm((prev) => ({ ...prev, planId: '' }));
+      return;
+    }
+
+    const rows = await api.getSurveyPlans(reservoirId);
+    setSurveyPlans(rows);
+    setForm((prev) => ({
+      ...prev,
+      planId: prev.planId && rows.some((p) => p.id === prev.planId) ? prev.planId : rows[0]?.id || ''
+    }));
+  };
+
   const loadData = async () => {
     const [taskRows, reservoirRows, userRows] = await Promise.all([
       api.getTasks(),
@@ -86,6 +104,7 @@ export default function TaskManagement() {
     }));
 
     await loadMarkers(nextReservoirId);
+    await loadPlans(nextReservoirId);
   };
 
   useEffect(() => {
@@ -118,6 +137,7 @@ export default function TaskManagement() {
       await api.createTask({
         reservoirId: form.reservoirId,
         markerId: form.markerId || undefined,
+        planId: form.planId || undefined,
         assignedTo: form.assignedTo || undefined,
         title: form.title,
         description: form.description,
@@ -131,6 +151,7 @@ export default function TaskManagement() {
       const nextAssignedTo = workers[0]?.id || '';
       setForm({ ...initialForm, reservoirId: nextReservoirId, assignedTo: nextAssignedTo, markerId: '' });
       await loadMarkers(nextReservoirId);
+      await loadPlans(nextReservoirId);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Tao task that bai');
     } finally {
@@ -191,6 +212,9 @@ export default function TaskManagement() {
         </select>
       </div>
       <h4 className="font-bold text-primary mb-1">{task.title}</h4>
+      {task.plan_title && (
+        <p className="text-[10px] text-on-surface-variant mb-1">Kế hoạch: {task.plan_title}</p>
+      )}
       <p className="text-xs text-on-surface-variant mb-4 line-clamp-2">{task.description}</p>
       <div className="space-y-2">
         <div className="flex items-center justify-between text-[10px] font-bold text-on-surface-variant">
@@ -327,10 +351,11 @@ export default function TaskManagement() {
                     value={form.reservoirId}
                     onChange={async (e) => {
                       const nextReservoirId = e.target.value;
-                      setForm((prev) => ({ ...prev, reservoirId: nextReservoirId, markerId: '' }));
+                      setForm((prev) => ({ ...prev, reservoirId: nextReservoirId, markerId: '', planId: '' }));
                       try {
                         setError(null);
                         await loadMarkers(nextReservoirId);
+                        await loadPlans(nextReservoirId);
                       } catch (err) {
                         setError(err instanceof Error ? err.message : 'Khong the tai danh sach moc giam sat');
                       }
@@ -376,6 +401,22 @@ export default function TaskManagement() {
                     ))}
                   </select>
                 </div>
+              </div>
+              <div>
+                <label className="block text-[11px] font-black uppercase text-on-surface-variant mb-1.5 tracking-wider">Kế hoạch khảo sát</label>
+                <select
+                  className="w-full bg-surface-container-highest border-none rounded-lg focus:ring-2 focus:ring-surface-tint p-3 text-sm outline-none"
+                  value={form.planId}
+                  onChange={(e) => setForm({ ...form, planId: e.target.value })}
+                  disabled={!form.reservoirId}
+                >
+                  <option value="">Không gắn kế hoạch</option>
+                  {surveyPlans.map((plan) => (
+                    <option value={plan.id} key={plan.id}>
+                      {plan.title}
+                    </option>
+                  ))}
+                </select>
               </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>

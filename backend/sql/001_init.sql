@@ -274,6 +274,7 @@ CREATE TRIGGER trg_notify_task_changes
 AFTER INSERT OR UPDATE OF assigned_to, status ON tasks
 FOR EACH ROW EXECUTE FUNCTION notify_task_changes();
 
+DROP VIEW IF EXISTS v_dashboard_summary CASCADE;
 CREATE OR REPLACE VIEW v_dashboard_summary AS
 SELECT
   (SELECT COUNT(*) FROM reservoirs WHERE status = 'active') AS active_reservoirs,

@@ -1,6 +1,6 @@
 import { Waves, HardHat, Flag, BadgeCheck, Download, Filter, MoreVertical, Maximize } from 'lucide-react';
 import { useState, useEffect } from 'react';
-import { api, DashboardSummary, SystemLog, Reservoir, Task } from '../services/api';
+import { api, DashboardSummary, SystemLog, Reservoir, Task, ReservoirOverview } from '../services/api';
 import { Link, useNavigate } from 'react-router-dom';
 
 type ReservoirBackendStatus = 'active' | 'inactive' | 'under_review';
@@ -28,10 +28,13 @@ export default function Dashboard() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null);
   const [logs, setLogs] = useState<SystemLog[]>([]);
   const [reservoirs, setReservoirs] = useState<Reservoir[]>([]);
+  const [hoaBinhOverview, setHoaBinhOverview] = useState<ReservoirOverview | null>(null);
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | ReservoirBackendStatus>('all');
   const [urgentTasksCount, setUrgentTasksCount] = useState(0);
   const [loading, setLoading] = useState(true);
+
+  const normalizeText = (value: string) => value.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
   useEffect(() => {
     const fetchData = async () => {
@@ -45,6 +48,14 @@ export default function Dashboard() {
         setSummary(summaryData);
         setLogs(logsData.slice(0, 3)); // Only show top 3 logs
         setReservoirs(reservoirsData.slice(0, 4)); // Only show top 4 reservoirs
+
+        const hoaBinh = reservoirsData.find((r) => normalizeText(r.name).includes('hoa binh'));
+        if (hoaBinh) {
+          const overview = await api.getReservoirOverview(hoaBinh.id);
+          setHoaBinhOverview(overview);
+        } else {
+          setHoaBinhOverview(null);
+        }
         
         const urgentCount = allTasks.filter(t => t.priority === 'urgent' && (t.status === 'pending' || t.status === 'in_progress')).length;
         setUrgentTasksCount(urgentCount);
@@ -95,6 +106,15 @@ export default function Dashboard() {
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
+
+  const overviewScan = hoaBinhOverview?.latest_scan || null;
+  const currentAreaM2 = hoaBinhOverview?.current_boundary?.area_m2 || overviewScan?.water_surface_area || null;
+  const changePercent = overviewScan?.change_percentage ?? null;
+  const compareLabel = overviewScan?.compare_mode === 'seasonal'
+    ? 'So với baseline mùa'
+    : overviewScan?.compare_mode === 'previous'
+      ? 'So với lần trước'
+      : 'Chưa có baseline';
 
   return (
     <div className="space-y-10">
@@ -170,6 +190,58 @@ export default function Dashboard() {
           <div className="absolute -right-4 -bottom-4 w-24 h-24 bg-primary-container rounded-full opacity-50 blur-2xl"></div>
         </div>
       </div>
+
+      {hoaBinhOverview && (
+        <section className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_24px_24px_rgba(0,51,88,0.03)]">
+          <div className="flex items-center justify-between mb-6">
+            <div>
+              <h3 className="text-xl font-black text-primary">Tổng quan hồ Hòa Bình</h3>
+              <p className="text-[11px] text-on-surface-variant mt-1">Cập nhật theo lần quét vệ tinh gần nhất</p>
+            </div>
+            <button
+              onClick={() => navigate('/reservoirs')}
+              className="text-xs font-bold text-primary hover:text-primary/80"
+            >
+              Xem chi tiết
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+            <div className="bg-white rounded-xl p-4 border border-slate-100">
+              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Diện tích hiện tại</p>
+              <p className="text-2xl font-black text-primary mt-2">
+                {currentAreaM2 ? `${(currentAreaM2 / 10000).toFixed(2)} ha` : 'N/A'}
+              </p>
+              <p className="text-[10px] text-on-surface-variant mt-1">{compareLabel}</p>
+            </div>
+            <div className="bg-white rounded-xl p-4 border border-slate-100">
+              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Biến động</p>
+              <p className={`text-2xl font-black mt-2 ${changePercent !== null && changePercent >= 0 ? 'text-emerald-600' : 'text-red-600'}`}>
+                {changePercent !== null ? `${changePercent.toFixed(1)}%` : 'N/A'}
+              </p>
+              <p className="text-[10px] text-on-surface-variant mt-1">{overviewScan?.season || '—'}</p>
+            </div>
+            <div className="bg-white rounded-xl p-4 border border-slate-100">
+              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Tình trạng mốc</p>
+              <p className="text-2xl font-black text-primary mt-2">{hoaBinhOverview.markers_warning}/{hoaBinhOverview.markers_total}</p>
+              <p className="text-[10px] text-on-surface-variant mt-1">Mốc cần kiểm tra</p>
+            </div>
+            <div className="bg-white rounded-xl p-4 border border-slate-100">
+              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Nhiệm vụ</p>
+              <p className="text-2xl font-black text-primary mt-2">
+                {hoaBinhOverview.tasks_in_progress}/{hoaBinhOverview.tasks_total}
+              </p>
+              <p className="text-[10px] text-on-surface-variant mt-1">Đang xử lý</p>
+            </div>
+            <div className="bg-white rounded-xl p-4 border border-slate-100">
+              <p className="text-[10px] uppercase tracking-widest text-on-surface-variant font-semibold">Cảnh báo</p>
+              <p className="text-2xl font-black text-primary mt-2">{overviewScan?.alert_level || 'N/A'}</p>
+              <p className="text-[10px] text-on-surface-variant mt-1">
+                {overviewScan?.capture_date ? new Date(overviewScan.capture_date).toLocaleDateString('vi-VN') : 'Chưa quét'}
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
 
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
         {/* Reservoir Status Overview Table */}

@@ -1,4 +1,6 @@
 const express = require('express');
+const { body } = require('express-validator');
+const validate = require('../middlewares/validate');
 const router = express.Router();
 const satelliteService = require('../services/satelliteService');
 const pool = require('../db/pool');
@@ -11,18 +13,25 @@ const { requireAuth, requireRole } = require('../middlewares/auth');
  *     summary: Trigger satellite analysis for a specific reservoir
  *     tags: [Satellite]
  */
-router.post('/analyze/:reservoirId', requireAuth, requireRole('admin'), async (req, res, next) => {
+router.post(
+  '/analyze/:reservoirId',
+  requireAuth,
+  requireRole('admin'),
+  [body('mode').optional().isIn(['auto', 'gee', 'planet'])],
+  validate,
+  async (req, res, next) => {
   try {
     const { reservoirId } = req.params;
-    const { date } = req.body;
+    const { date, mode } = req.body;
     const dateStr = date || new Date().toISOString().split('T')[0];
 
-    const result = await satelliteService.analyzeReservoir(reservoirId, dateStr);
+    const result = await satelliteService.analyzeReservoir(reservoirId, dateStr, mode || 'auto');
     res.json({ success: true, data: result });
   } catch (error) {
     next(error);
   }
-});
+  }
+);
 
 /**
  * @swagger
@@ -31,14 +40,22 @@ router.post('/analyze/:reservoirId', requireAuth, requireRole('admin'), async (r
  *     summary: Trigger satellite analysis for all active reservoirs
  *     tags: [Satellite]
  */
-router.post('/analyze-all', requireAuth, requireRole('admin'), async (req, res, next) => {
+router.post(
+  '/analyze-all',
+  requireAuth,
+  requireRole('admin'),
+  [body('mode').optional().isIn(['auto', 'gee', 'planet'])],
+  validate,
+  async (req, res, next) => {
   try {
-    const results = await satelliteService.analyzeAllReservoirs();
+    const { mode } = req.body || {};
+    const results = await satelliteService.analyzeAllReservoirs(mode || 'auto');
     res.json({ success: true, data: { total: results.length, results } });
   } catch (error) {
     next(error);
   }
-});
+  }
+);
 
 /**
  * @swagger
@@ -51,7 +68,8 @@ router.get('/history/:reservoirId', requireAuth, async (req, res, next) => {
   try {
     const { reservoirId } = req.params;
     const result = await pool.query(
-      `SELECT id, capture_date, water_surface_area, change_percentage, alert_level, raw_response, created_at
+      `SELECT id, capture_date, water_surface_area, change_percentage, alert_level, raw_response, created_at,
+              season, baseline_area_m2, delta_previous_percent, compare_mode, boundary_id
        FROM satellite_analysis
        WHERE reservoir_id = $1
        ORDER BY capture_date DESC

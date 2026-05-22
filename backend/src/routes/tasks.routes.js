@@ -34,6 +34,17 @@ async function markerBelongsToReservoir(markerId, reservoirId) {
   return result.rowCount > 0;
 }
 
+async function planBelongsToReservoir(planId, reservoirId) {
+  const result = await pool.query(
+    `SELECT id
+     FROM survey_plans
+     WHERE id = $1 AND reservoir_id = $2`,
+    [planId, reservoirId]
+  );
+
+  return result.rowCount > 0;
+}
+
 /**
  * @swagger
  * tags:
@@ -75,7 +86,8 @@ router.get(
   [
     query('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
     query('assignedTo').optional().isUUID(),
-    query('reservoirId').optional().isUUID()
+    query('reservoirId').optional().isUUID(),
+    query('planId').optional().isUUID()
   ],
   validate,
   asyncHandler(async (req, res) => {
@@ -97,19 +109,25 @@ router.get(
       conditions.push(`t.reservoir_id = $${values.length}`);
     }
 
+    if (req.query.planId) {
+      values.push(req.query.planId);
+      conditions.push(`t.plan_id = $${values.length}`);
+    }
+
     if (req.user.role === 'worker') {
       values.push(req.user.sub);
       conditions.push(`t.assigned_to = $${values.length}`);
     }
 
     const result = await pool.query(
-          `SELECT t.*, r.name AS reservoir_name, m.code AS marker_code,
-            CASE WHEN m.location IS NULL THEN NULL ELSE ST_AsGeoJSON(m.location)::json END AS marker_location_geojson,
-            u.full_name AS assigned_to_name
+      `SELECT t.*, r.name AS reservoir_name, m.code AS marker_code,
+              CASE WHEN m.location IS NULL THEN NULL ELSE ST_AsGeoJSON(m.location)::json END AS marker_location_geojson,
+              u.full_name AS assigned_to_name, sp.title AS plan_title
        FROM tasks t
        JOIN reservoirs r ON r.id = t.reservoir_id
        LEFT JOIN boundary_markers m ON m.id = t.marker_id
        LEFT JOIN users u ON u.id = t.assigned_to
+       LEFT JOIN survey_plans sp ON sp.id = t.plan_id
        WHERE ${conditions.join(' AND ')}
        ORDER BY t.created_at DESC`,
       values
@@ -147,6 +165,7 @@ router.post(
     body('reservoirId').isUUID(),
     body('markerId').optional().isUUID(),
     body('assignedTo').optional().isUUID(),
+    body('planId').optional().isUUID(),
     body('title').isString().isLength({ min: 3 }),
     body('template').optional().isString().isLength({ min: 2, max: 100 }),
     body('status').optional().isIn(['pending', 'in_progress', 'completed', 'cancelled']),
@@ -158,6 +177,7 @@ router.post(
       reservoirId,
       markerId,
       assignedTo,
+      planId,
       title,
       description,
       template,
@@ -180,15 +200,23 @@ router.post(
       }
     }
 
+    if (planId) {
+      const planValid = await planBelongsToReservoir(planId, reservoirId);
+      if (!planValid) {
+        return res.status(400).json({ success: false, message: 'planId không thuộc reservoirId đã chọn' });
+      }
+    }
+
     const result = await pool.query(
-      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, title, description, template, status, priority, due_date)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      `INSERT INTO tasks (reservoir_id, marker_id, assigned_to, created_by, plan_id, title, description, template, status, priority, due_date)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         reservoirId,
         markerId || null,
         assignedTo || null,
         req.user.sub,
+        planId || null,
         title,
         description || null,
         template || null,
@@ -242,15 +270,17 @@ router.patch(
     body('priority').optional().isIn(['low', 'medium', 'high', 'urgent']),
     body('assignedTo').optional({ nullable: true }).isUUID(),
     body('markerId').optional({ nullable: true }).isUUID(),
-    body('dueDate').optional({ nullable: true }).isISO8601()
+    body('dueDate').optional({ nullable: true }).isISO8601(),
+    body('planId').optional({ nullable: true }).isUUID()
   ],
   validate,
   asyncHandler(async (req, res) => {
     const { id } = req.params;
-    const { title, description, template, status, priority, assignedTo, markerId, dueDate } = req.body;
+    const { title, description, template, status, priority, assignedTo, markerId, dueDate, planId } = req.body;
     const hasAssignedTo = Object.prototype.hasOwnProperty.call(req.body, 'assignedTo');
     const hasMarkerId = Object.prototype.hasOwnProperty.call(req.body, 'markerId');
     const hasDueDate = Object.prototype.hasOwnProperty.call(req.body, 'dueDate');
+    const hasPlanId = Object.prototype.hasOwnProperty.call(req.body, 'planId');
 
     const oldTask = await pool.query('SELECT assigned_to, title, reservoir_id FROM tasks WHERE id = $1', [id]);
     if (!oldTask.rowCount) {
@@ -271,6 +301,13 @@ router.patch(
       }
     }
 
+    if (hasPlanId && planId !== null) {
+      const planValid = await planBelongsToReservoir(planId, oldTask.rows[0].reservoir_id);
+      if (!planValid) {
+        return res.status(400).json({ success: false, message: 'planId không thuộc reservoir của task' });
+      }
+    }
+
     const result = await pool.query(
       `UPDATE tasks
        SET title = COALESCE($1, title),
@@ -280,8 +317,9 @@ router.patch(
            priority = COALESCE($5, priority),
            assigned_to = CASE WHEN $6::boolean THEN $7::uuid ELSE assigned_to END,
            marker_id = CASE WHEN $8::boolean THEN $9::uuid ELSE marker_id END,
-           due_date = CASE WHEN $10::boolean THEN $11::date ELSE due_date END
-       WHERE id = $12
+           due_date = CASE WHEN $10::boolean THEN $11::date ELSE due_date END,
+           plan_id = CASE WHEN $12::boolean THEN $13::uuid ELSE plan_id END
+       WHERE id = $14
        RETURNING *`,
       [
         title || null,
@@ -295,6 +333,8 @@ router.patch(
         markerId ?? null,
         hasDueDate,
         dueDate ?? null,
+        hasPlanId,
+        planId ?? null,
         id
       ]
     );
