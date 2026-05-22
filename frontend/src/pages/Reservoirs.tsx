@@ -251,13 +251,44 @@ function normalizeText(value: string) {
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
 }
-
-function polygonToLatLng(boundary: { type: 'Polygon'; coordinates: number[][][] }): [number, number][] {
-  if (!boundary || boundary.type !== 'Polygon' || !boundary.coordinates.length) {
-    return [] as [number, number][];
+function polygonToLatLng(boundary: any): [number, number][] {
+  if (!boundary) return [];
+  
+  let geom = boundary;
+  if (typeof boundary === 'string') {
+    try {
+      geom = JSON.parse(boundary);
+    } catch (e) {
+      console.error('Failed to parse boundary GeoJSON string:', e);
+      return [];
+    }
   }
 
-  return boundary.coordinates[0].map(([lng, lat]) => [lat, lng] as [number, number]);
+  if (geom.type === 'Feature') {
+    geom = geom.geometry;
+  }
+  if (!geom) return [];
+
+  if (geom.type === 'Polygon') {
+    if (!geom.coordinates || !geom.coordinates.length) return [];
+    return geom.coordinates[0].map(([lng, lat]: any) => [Number(lat), Number(lng)] as [number, number]);
+  }
+  
+  if (geom.type === 'MultiPolygon') {
+    if (!geom.coordinates || !geom.coordinates.length || !geom.coordinates[0].length) return [];
+    let largestIdx = 0;
+    let maxPoints = 0;
+    for (let i = 0; i < geom.coordinates.length; i++) {
+      const poly = geom.coordinates[i];
+      if (poly && poly[0] && poly[0].length > maxPoints) {
+        maxPoints = poly[0].length;
+        largestIdx = i;
+      }
+    }
+    return geom.coordinates[largestIdx][0].map(([lng, lat]: any) => [Number(lat), Number(lng)] as [number, number]);
+  }
+  
+  return [];
 }
 
 function MapClickCapture({
