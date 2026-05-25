@@ -90,7 +90,8 @@ async function runGeeScan(payload) {
     }
 
     console.log(`[GEE Service] Sending POST request to GEE runner at ${endpoint}...`);
-    const response = await axios.post(endpoint, payload, { headers, timeout: 5000 }); // Fast 5s timeout to trigger quick fallback offline
+    const response = await axios.post(endpoint, payload, { headers, timeout: 60000 }); // 60s timeout for real Google Earth Engine cloud processing
+
     return response.data;
   } catch (error) {
     console.warn(`[GEE Service] External GEE runner failed (${error.message}). Falling back to simulation scan...`);

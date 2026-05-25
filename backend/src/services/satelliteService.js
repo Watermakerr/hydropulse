@@ -471,6 +471,41 @@ class SatelliteService {
          FROM users WHERE role = 'admin' AND is_active = TRUE AND deleted_at IS NULL`,
         [`Diện tích mặt nước hồ thay đổi ${changePercentage.toFixed(1)}% (ngày ${date})`]
       );
+
+      // Auto-create a needs_inspection marker at reservoir centroid when alert is HIGH
+      try {
+        const centroidResult = await pool.query(
+          `SELECT
+             ST_Y(ST_Centroid(boundary)) AS lat,
+             ST_X(ST_Centroid(boundary)) AS lng
+           FROM reservoirs
+           WHERE id = $1 AND boundary IS NOT NULL`,
+          [reservoirId]
+        );
+
+        if (centroidResult.rows.length > 0) {
+          const { lat, lng } = centroidResult.rows[0];
+          const alertCode = `ALERT-${date}-${Date.now().toString().slice(-6)}`;
+          const direction = changePercentage > 0 ? 'tăng' : 'giảm';
+          const absChange = Math.abs(changePercentage).toFixed(1);
+
+          await pool.query(
+            `INSERT INTO boundary_markers (reservoir_id, code, name, location, order_index, status)
+             VALUES ($1, $2, $3, ST_SetSRID(ST_MakePoint($4, $5), 4326), 999, 'needs_inspection')
+             ON CONFLICT DO NOTHING`,
+            [
+              reservoirId,
+              alertCode,
+              `⚠ Cảnh báo vệ tinh: diện tích ${direction} ${absChange}% (${date})`,
+              lng,
+              lat
+            ]
+          );
+          console.log(`[SatelliteService] Auto-created alert marker ${alertCode} for reservoir ${reservoirId}`);
+        }
+      } catch (markerErr) {
+        console.warn('[SatelliteService] Failed to auto-create alert marker:', markerErr.message);
+      }
     }
 
     return { changePercentage, deltaPreviousPercent, alertLevel };

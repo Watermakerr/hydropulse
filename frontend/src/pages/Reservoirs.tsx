@@ -4,7 +4,7 @@ import 'leaflet/dist/leaflet.css';
 import {
   FileText, MapPin, Plus, ShieldCheck, Trash2, Pencil, Search, Waves, Flag, AlertTriangle,
   ChevronRight, Eye, MapPinOff, CircleDot, X, Upload, Clock, CheckCircle2, XCircle,
-  Satellite, BarChart3, Navigation, Crosshair, ClipboardCheck, Sliders
+  Satellite, BarChart3, Navigation, Crosshair, ClipboardCheck, Sliders, Layers
 } from 'lucide-react';
 import L from 'leaflet';
 import { useSearchParams } from 'react-router-dom';
@@ -352,6 +352,7 @@ export default function Reservoirs() {
   const [reportDraft, setReportDraft] = useState({ description: '', conditionStatus: 'good' });
   const [satelliteHistory, setSatelliteHistory] = useState<SatelliteHistory[]>([]);
   const [satelliteLoading, setSatelliteLoading] = useState(false);
+  const [alertBanner, setAlertBanner] = useState<{ type: 'HIGH' | 'MEDIUM' | 'LOW'; change: number; newMarkersCount: number } | null>(null);
   const [shorelines, setShorelines] = useState<ShorelineBoundary[]>([]);
   const [floodExpansion, setFloodExpansion] = useState<FloodExpansion | null>(null);
   const [shorelineLoading, setShorelineLoading] = useState(false);
@@ -364,6 +365,8 @@ export default function Reservoirs() {
   const [comparisonMode, setComparisonMode] = useState<'current' | 'baseline' | 'blend'>('blend');
   const [comparisonBlend, setComparisonBlend] = useState<number>(0.5);
   const [showCorridor, setShowCorridor] = useState<boolean>(true);
+  const [showSafeMarkers, setShowSafeMarkers] = useState<boolean>(true);
+  const [showWarningMarkers, setShowWarningMarkers] = useState<boolean>(true);
 
   const { scanOpacity, baselineOpacity } = useMemo(() => {
     if (comparisonMode === 'current') return { scanOpacity: 1, baselineOpacity: 0 };
@@ -652,6 +655,7 @@ export default function Reservoirs() {
     const run = async () => {
       try {
         setError(null);
+        setAlertBanner(null);
         setSelectedSceneId(null);
         setSelectedBoundaryId(null);
         setSelectedHistoryRecord(null);
@@ -941,11 +945,24 @@ export default function Reservoirs() {
 
   const submitSatelliteAnalysis = async () => {
     if (!activeReservoir) return;
+    const prevMarkerCount = markers.length;
     await withAction(async () => {
-      await api.triggerSatelliteAnalysis(activeReservoir, undefined, 'gee');
-      await loadSatelliteHistory(activeReservoir);
-      await loadShorelines(activeReservoir);
-      await loadFloodExpansion(activeReservoir);
+      const result = await api.triggerSatelliteAnalysis(activeReservoir, undefined, 'gee');
+      await Promise.all([
+        loadSatelliteHistory(activeReservoir),
+        loadShorelines(activeReservoir),
+        loadFloodExpansion(activeReservoir),
+        loadMarkers(activeReservoir)
+      ]);
+      // Show alert banner if HIGH alert was detected
+      const alertLevel = (result as any)?.alertLevel;
+      const changePercentage = (result as any)?.changePercentage ?? 0;
+      if (alertLevel === 'HIGH' || alertLevel === 'MEDIUM') {
+        const newMarkers = await api.getMarkers(activeReservoir);
+        setMarkers(newMarkers);
+        const newMarkersCount = Math.max(0, newMarkers.length - prevMarkerCount);
+        setAlertBanner({ type: alertLevel, change: changePercentage, newMarkersCount });
+      }
     });
   };
 
@@ -1033,6 +1050,46 @@ export default function Reservoirs() {
           <button onClick={() => setError(null)} className="p-1 hover:bg-red-100 rounded-lg transition-colors">
             <X className="w-4 h-4" />
           </button>
+        </div>
+      )}
+
+      {/* Satellite Alert Banner — auto-created markers notification */}
+      {alertBanner && (
+        <div className={`relative overflow-hidden rounded-xl border px-4 py-3.5 animate-fade-in-up ${
+          alertBanner.type === 'HIGH'
+            ? 'bg-gradient-to-r from-red-50 to-orange-50 border-red-200 text-red-800'
+            : 'bg-gradient-to-r from-amber-50 to-yellow-50 border-amber-200 text-amber-800'
+        }`}>
+          {/* Pulsing accent bar */}
+          <div className={`absolute left-0 top-0 bottom-0 w-1 rounded-l-xl ${alertBanner.type === 'HIGH' ? 'bg-red-500' : 'bg-amber-500'}`} />
+          <div className="flex items-start gap-3 pl-2">
+            <div className={`p-2 rounded-lg shrink-0 ${alertBanner.type === 'HIGH' ? 'bg-red-100' : 'bg-amber-100'}`}>
+              <Satellite className={`w-5 h-5 ${alertBanner.type === 'HIGH' ? 'text-red-600' : 'text-amber-600'}`} />
+            </div>
+            <div className="flex-1 min-w-0">
+              <p className="font-bold text-sm">
+                {alertBanner.type === 'HIGH' ? '🚨 Cảnh báo vệ tinh mức CAO' : '⚠ Cảnh báo vệ tinh mức TRUNG BÌNH'}
+              </p>
+              <p className="text-xs mt-0.5 opacity-80">
+                Diện tích mặt nước {alertBanner.change > 0 ? 'tăng' : 'giảm'}{' '}
+                <span className="font-bold">{Math.abs(alertBanner.change).toFixed(1)}%</span> so với đường cơ sở.
+                {alertBanner.newMarkersCount > 0 && (
+                  <span className="ml-1 font-semibold">
+                    Hệ thống đã tự động tạo <span className="underline">{alertBanner.newMarkersCount} cột mốc kiểm tra</span> trên bản đồ.
+                  </span>
+                )}
+                {alertBanner.newMarkersCount === 0 && alertBanner.type === 'HIGH' && (
+                  <span className="ml-1 font-semibold"> Cột mốc kiểm tra đã được ghi nhận vào hệ thống.</span>
+                )}
+              </p>
+            </div>
+            <button
+              onClick={() => setAlertBanner(null)}
+              className={`p-1.5 rounded-lg transition-colors shrink-0 ${alertBanner.type === 'HIGH' ? 'hover:bg-red-100' : 'hover:bg-amber-100'}`}
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
         </div>
       )}
 
@@ -1200,7 +1257,7 @@ export default function Reservoirs() {
         <section className="col-span-12 lg:col-span-9 flex flex-col gap-6">
 
           {/* ── Map ──────────────────────────────────────────────────── */}
-          <div className="relative bg-surface-container-highest rounded-2xl overflow-hidden h-[480px] shadow-[0_8px_32px_rgba(0,51,88,0.06)] z-0">
+          <div className="relative bg-surface-container-highest rounded-2xl overflow-hidden h-[640px] shadow-[0_8px_32px_rgba(0,51,88,0.06)] z-0">
             <MapContainer center={currentCenter} zoom={13} style={{ height: '100%', width: '100%' }} zoomControl={false}>
               <MapUpdater center={currentCenter} />
               <MapClickCapture enabled={markerModalOpen || quickMarkerMode} onClick={handleMapPick} />
@@ -1312,28 +1369,30 @@ export default function Reservoirs() {
                   pathOptions={{ color: '#f97316', weight: 4, fillOpacity: 0, dashArray: '2 4' }}
                 />
               )}
-              {markers.map((marker) => (
-                <LeafletMarker
-                  key={marker.id}
-                  position={[marker.location_geojson.coordinates[1], marker.location_geojson.coordinates[0]]}
-                  icon={marker.status === 'normal' ? healthyIcon : warningIcon}
-                >
-                  <Popup>
-                    <div className="min-w-[160px]">
-                      <strong className="text-sm">{marker.name}</strong>
-                      <br />
-                      <span className="text-xs text-slate-500">Mã: {marker.code}</span>
-                      <br />
-                      <span className="text-xs">Trạng thái: <strong>{markerStatusVi[marker.status]}</strong></span>
-                    </div>
-                  </Popup>
-                </LeafletMarker>
-              ))}
+              {markers
+                .filter((marker) => (marker.status === 'normal' ? showSafeMarkers : showWarningMarkers))
+                .map((marker) => (
+                  <LeafletMarker
+                    key={marker.id}
+                    position={[marker.location_geojson.coordinates[1], marker.location_geojson.coordinates[0]]}
+                    icon={marker.status === 'normal' ? healthyIcon : warningIcon}
+                  >
+                    <Popup>
+                      <div className="min-w-[160px]">
+                        <strong className="text-sm">{marker.name}</strong>
+                        <br />
+                        <span className="text-xs text-slate-500">Mã: {marker.code}</span>
+                        <br />
+                        <span className="text-xs">Trạng thái: <strong>{markerStatusVi[marker.status]}</strong></span>
+                      </div>
+                    </Popup>
+                  </LeafletMarker>
+                ))}
             </MapContainer>
 
             {/* Quick Marker Mode Banner */}
             {quickMarkerMode && (
-              <div className="absolute top-3 left-3 bg-white/95 backdrop-blur-md px-4 py-2.5 rounded-xl text-xs font-bold text-primary shadow-lg flex items-center gap-2 animate-fade-in-up">
+              <div className="absolute top-3 left-3 bg-white/95 backdrop-blur-md px-4 py-2.5 rounded-xl text-xs font-bold text-primary shadow-lg flex items-center gap-2 animate-fade-in-up z-[500]">
                 <Crosshair className="w-4 h-4 text-primary animate-pulse" />
                 <span>Click vào bản đồ để tạo cột mốc nhanh</span>
                 <button onClick={() => setQuickMarkerMode(false)} className="ml-2 p-1 hover:bg-slate-100 rounded-lg">
@@ -1343,78 +1402,10 @@ export default function Reservoirs() {
             )}
 
             {shorelineLoading && (
-              <div className="absolute top-14 left-3 bg-white/90 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-on-surface-variant shadow-lg animate-fade-in-up">
+              <div className="absolute top-14 left-3 bg-white/90 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-on-surface-variant shadow-lg animate-fade-in-up z-[500]">
                 Đang tải lớp ranh giới...
               </div>
             )}
-
-            {/* Map Layer Toggle */}
-            <div className="absolute top-3 right-3 bg-white/95 backdrop-blur-md px-1.5 py-1.5 rounded-xl text-xs font-bold text-primary shadow-lg flex gap-1">
-              <button
-                className={`px-3 py-1.5 rounded-lg transition-all ${baseLayer === 'esri' ? 'bg-primary text-white shadow-sm' : 'hover:bg-slate-100 text-on-surface-variant'}`}
-                onClick={() => setBaseLayer('esri')}
-              >
-                Vệ tinh
-              </button>
-              <button
-                className={`px-3 py-1.5 rounded-lg transition-all ${baseLayer === 'sentinel2' ? 'bg-primary text-white shadow-sm' : 'hover:bg-slate-100 text-on-surface-variant'} ${!sentinelEnabled ? 'opacity-40 cursor-not-allowed' : ''
-                  }`}
-                onClick={() => {
-                  if (sentinelEnabled) {
-                    setBaseLayer('sentinel2');
-                  }
-                }}
-                title={
-                  sentinelEnabled
-                    ? 'Bật lớp ảnh Sentinel-2'
-                    : 'Cần cấu hình VITE_SENTINEL2_TILE_URL trong file .env để bật Sentinel-2'
-                }
-              >
-                Sentinel-2
-              </button>
-            </div>
-
-            <div className="absolute top-14 right-3 bg-white/95 backdrop-blur-md px-3 py-2 rounded-xl text-[10px] font-bold text-primary shadow-lg space-y-2 w-40">
-              <div className="text-[9px] uppercase tracking-widest text-on-surface-variant">Lớp ranh giới</div>
-              <div className="space-y-1">
-                {shorelineLayerOptions.map((layer) => (
-                  <button
-                    key={layer.key}
-                    className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg transition-colors ${shorelineLayers[layer.key]
-                        ? 'bg-primary/10 text-primary'
-                        : 'text-on-surface-variant hover:bg-surface-container'
-                      }`}
-                    onClick={() =>
-                      setShorelineLayers((prev) => ({
-                        ...prev,
-                        [layer.key]: !prev[layer.key]
-                      }))
-                    }
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className={`w-2 h-2 rounded-full ${layer.color}`}></span>
-                      <span>{layer.label}</span>
-                    </div>
-                    <span>{shorelineLayers[layer.key] ? 'On' : 'Off'}</span>
-                  </button>
-                ))}
-                
-                {/* Hành lang đệm toggle */}
-                <button
-                  className={`w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg transition-colors border-t border-slate-100/50 mt-1 pt-1.5 ${showCorridor
-                      ? 'bg-purple-50 text-purple-700'
-                      : 'text-on-surface-variant hover:bg-surface-container'
-                    }`}
-                  onClick={() => setShowCorridor((prev) => !prev)}
-                >
-                  <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-purple-500 animate-pulse"></span>
-                    <span className="font-bold">Hành lang 100m</span>
-                  </div>
-                  <span>{showCorridor ? 'On' : 'Off'}</span>
-                </button>
-              </div>
-            </div>
 
             {/* Map Info Overlay */}
             {currentReservoir && (
@@ -1431,58 +1422,170 @@ export default function Reservoirs() {
               </div>
             )}
 
-            {/* Map Legend Overlay */}
-            <div className="absolute bottom-3 right-3 bg-white/95 backdrop-blur-md px-3.5 py-3 rounded-xl shadow-lg w-48 z-[500] text-[10px] font-sans border border-slate-100/80 flex flex-col gap-2 animate-fade-in">
-              <div className="font-bold text-[11px] text-primary border-b border-slate-100 pb-1.5 uppercase tracking-wider flex items-center gap-1.5">
-                <span className="w-1.5 h-3 bg-primary rounded-full"></span>
-                Chú thích bản đồ
+            {/* Unified Map Control & Legend Panel */}
+            <div className="absolute top-3 right-3 bottom-3 w-64 bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl border border-slate-100/80 p-4 z-[500] flex flex-col gap-4 overflow-y-auto custom-scrollbar animate-fade-in">
+              {/* Header */}
+              <div className="border-b border-slate-100 pb-2.5">
+                <div className="font-black text-xs text-primary uppercase tracking-widest flex items-center gap-2">
+                  <Layers className="w-4 h-4 text-primary animate-pulse" />
+                  Bảng điều khiển bản đồ
+                </div>
               </div>
-              <div className="flex flex-col gap-2 mt-0.5">
-                <div className="flex items-center gap-2.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 border border-emerald-400 shadow-[0_0_4px_rgba(16,185,129,0.3)]"></span>
-                  <span className="text-on-surface-variant font-semibold">Cột mốc an toàn</span>
+
+              {/* Base Map Selector */}
+              <div className="space-y-2">
+                <div className="text-[9px] uppercase tracking-widest text-on-surface-variant font-bold">Bản đồ nền</div>
+                <div className="bg-slate-100/80 p-1 rounded-xl flex gap-1">
+                  <button
+                    className={`flex-1 text-center py-2 rounded-lg text-xs font-bold transition-all ${baseLayer === 'esri' ? 'bg-white text-primary shadow-sm' : 'hover:bg-white/40 text-on-surface-variant'}`}
+                    onClick={() => setBaseLayer('esri')}
+                  >
+                    Vệ tinh ESRI
+                  </button>
+                  <button
+                    className={`flex-1 text-center py-2 rounded-lg text-xs font-bold transition-all ${baseLayer === 'sentinel2' ? 'bg-white text-primary shadow-sm' : 'hover:bg-white/40 text-on-surface-variant'} ${!sentinelEnabled ? 'opacity-40 cursor-not-allowed' : ''}`}
+                    onClick={() => {
+                      if (sentinelEnabled) {
+                        setBaseLayer('sentinel2');
+                      }
+                    }}
+                    title={
+                      sentinelEnabled
+                        ? 'Bật lớp ảnh Sentinel-2'
+                        : 'Cần cấu hình VITE_SENTINEL2_TILE_URL trong file .env để bật Sentinel-2'
+                    }
+                  >
+                    Sentinel-2
+                  </button>
                 </div>
-                <div className="flex items-center gap-2.5">
-                  <span className="w-2.5 h-2.5 rounded-full bg-red-500 border border-red-400 animate-pulse shadow-[0_0_8px_rgba(239,68,68,0.5)]"></span>
-                  <span className="text-on-surface-variant font-semibold">Cột mốc cảnh báo</span>
+              </div>
+
+              {/* Data Layers Toggles */}
+              <div className="space-y-2.5 flex-1">
+                <div className="text-[9px] uppercase tracking-widest text-on-surface-variant font-bold">Các lớp dữ liệu</div>
+                <div className="flex flex-col gap-1.5">
+                  {/* Safe Markers Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShowSafeMarkers(prev => !prev)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-3 h-3 rounded-full bg-emerald-500 border-2 border-emerald-400 shadow-[0_0_4px_rgba(16,185,129,0.3)] shrink-0"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Cột mốc an toàn</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${showSafeMarkers ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${showSafeMarkers ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Warning Markers Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShowWarningMarkers(prev => !prev)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-3 h-3 rounded-full bg-red-500 border-2 border-red-400 animate-pulse shadow-[0_0_6px_rgba(239,68,68,0.4)] shrink-0"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Cột mốc cảnh báo</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${showWarningMarkers ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${showWarningMarkers ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  <div className="border-t border-slate-100 my-1"></div>
+
+                  {/* Normal Boundary Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShorelineLayers(prev => ({ ...prev, normal: !prev.normal }))}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-1.5 border-t-2 border-slate-800 shrink-0 mt-0.5"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Ranh giới hiện trạng</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${shorelineLayers.normal ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${shorelineLayers.normal ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Dry Boundary Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShorelineLayers(prev => ({ ...prev, dry: !prev.dry }))}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-1.5 border-t-2 border-[#f59e0b] shrink-0 mt-0.5"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Ranh giới mùa khô</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${shorelineLayers.dry ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${shorelineLayers.dry ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Wet Boundary Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShorelineLayers(prev => ({ ...prev, wet: !prev.wet }))}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-1.5 border-t-2 border-[#2563eb] shrink-0 mt-0.5"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Ranh giới mùa mưa</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${shorelineLayers.wet ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${shorelineLayers.wet ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Scan Boundary Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShorelineLayers(prev => ({ ...prev, scan: !prev.scan }))}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-1.5 border-t-2 border-[#14b8a6] shrink-0 mt-0.5"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Ranh giới quét mới</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${shorelineLayers.scan ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${shorelineLayers.scan ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Flood Expansion Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShorelineLayers(prev => ({ ...prev, flood: !prev.flood }))}
+                  >
+                    <div className="flex items-center gap-3">
+                      <span className="w-5 h-1.5 border-t-2 border-[#22d3ee] shrink-0 mt-0.5"></span>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Ngập mở rộng</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${shorelineLayers.flood ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${shorelineLayers.flood ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
+
+                  {/* Buffer Zone Toggle */}
+                  <button
+                    className="w-full flex items-center justify-between p-2 rounded-xl hover:bg-slate-50 transition-all text-left group"
+                    onClick={() => setShowCorridor(prev => !prev)}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-5 h-3 bg-purple-500/20 border border-purple-500/40 rounded-sm shadow-[0_0_4px_rgba(168,85,247,0.2)] shrink-0"></div>
+                      <span className="text-xs font-bold text-on-surface-variant group-hover:text-primary transition-colors">Hành lang đệm (100m)</span>
+                    </div>
+                    {/* Toggle Switch */}
+                    <div className={`w-8 h-4.5 rounded-full transition-colors relative shrink-0 ${showCorridor ? 'bg-primary' : 'bg-slate-200'}`}>
+                      <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-transform shadow-sm ${showCorridor ? 'translate-x-4' : 'translate-x-0.5'}`}></div>
+                    </div>
+                  </button>
                 </div>
-                
-                {shorelineLayers.normal && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <span className="w-4 h-1 border-t-2 border-slate-800"></span>
-                    <span className="text-on-surface-variant font-semibold">Ranh giới hiện trạng</span>
-                  </div>
-                )}
-                {shorelineLayers.dry && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <span className="w-4 h-1 border-t-2 border-[#f59e0b]"></span>
-                    <span className="text-on-surface-variant font-semibold">Ranh giới mùa khô</span>
-                  </div>
-                )}
-                {shorelineLayers.wet && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <span className="w-4 h-1 border-t-2 border-[#2563eb]"></span>
-                    <span className="text-on-surface-variant font-semibold">Ranh giới mùa mưa</span>
-                  </div>
-                )}
-                {shorelineLayers.scan && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <span className="w-4 h-1 border-t-2 border-[#14b8a6]"></span>
-                    <span className="text-on-surface-variant font-semibold">Ranh giới quét mới</span>
-                  </div>
-                )}
-                {shorelineLayers.flood && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <span className="w-4 h-1 border-t-2 border-[#22d3ee]"></span>
-                    <span className="text-on-surface-variant font-semibold">Ngập mở rộng</span>
-                  </div>
-                )}
-                {showCorridor && (
-                  <div className="flex items-center gap-2.5 animate-fade-in">
-                    <div className="w-4 h-2.5 bg-purple-500/20 border border-purple-500/40 rounded-sm shadow-[0_0_4px_rgba(168,85,247,0.2)]"></div>
-                    <span className="text-on-surface-variant font-semibold">Hành lang đệm (100m)</span>
-                  </div>
-                )}
               </div>
             </div>
           </div>
@@ -1995,30 +2098,63 @@ export default function Reservoirs() {
 
           {/* ── Satellite Section ─────────────────────────────────────── */}
           <div className="bg-surface-container-lowest rounded-2xl p-6 shadow-[0_4px_16px_rgba(0,51,88,0.04)]">
-            <div className="flex justify-between items-center mb-5">
-              <div>
-                <h3 className="text-base font-black text-primary flex items-center gap-2">
-                    <Satellite className="w-5 h-5" /> Phân tích vệ tinh GEE
+            <div className="flex justify-between items-start mb-5 gap-4">
+              <div className="min-w-0">
+                <h3 className="text-base font-black text-primary flex items-center gap-2 flex-wrap">
+                  <Satellite className="w-5 h-5 shrink-0" />
+                  Phân tích vệ tinh GEE
+                  {/* Reservoir badge */}
+                  {currentReservoir ? (
+                    <span className="inline-flex items-center gap-1.5 bg-primary/[0.08] text-primary px-2.5 py-0.5 rounded-full text-xs font-bold">
+                      <Waves className="w-3 h-3" />
+                      {currentReservoir.name}
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 bg-slate-100 text-slate-400 px-2.5 py-0.5 rounded-full text-xs font-semibold">
+                      Chưa chọn hồ
+                    </span>
+                  )}
+                  {/* Latest alert badge */}
+                  {latestAlert && (
+                    <span className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-bold ${
+                      latestAlert === 'HIGH'
+                        ? 'bg-red-50 text-red-700'
+                        : latestAlert === 'MEDIUM'
+                        ? 'bg-amber-50 text-amber-700'
+                        : 'bg-emerald-50 text-emerald-700'
+                    }`}>
+                      <span className={`w-1.5 h-1.5 rounded-full ${latestAlert === 'HIGH' ? 'bg-red-500 animate-pulse' : latestAlert === 'MEDIUM' ? 'bg-amber-500' : 'bg-emerald-500'}`} />
+                      {latestAlert === 'HIGH' ? 'Cảnh báo CAO' : latestAlert === 'MEDIUM' ? 'Cảnh báo TRUNG BÌNH' : 'Bình thường'}
+                    </span>
+                  )}
                 </h3>
-                  <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử quét ảnh theo mùa (mưa/khô) và so sánh với baseline phù hợp</p>
+                <p className="text-[11px] text-on-surface-variant mt-1">Lịch sử quét ảnh theo mùa (mưa/khô) và so sánh với baseline phù hợp</p>
               </div>
               <button
                 onClick={submitSatelliteAnalysis}
-                disabled={working || satelliteLoading}
-                className="px-5 py-2.5 bg-primary text-white rounded-xl text-xs font-bold disabled:opacity-50 hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/20 flex items-center gap-2"
-                title="Có thể mất đến 1 phút"
+                disabled={working || satelliteLoading || !activeReservoir}
+                className="px-5 py-2.5 bg-primary text-white rounded-xl text-xs font-bold disabled:opacity-50 hover:bg-primary/90 transition-all hover:shadow-lg hover:shadow-primary/20 flex items-center gap-2 shrink-0"
+                title={!activeReservoir ? 'Vui lòng chọn hồ trước' : 'Có thể mất đến 1 phút'}
               >
                 <Satellite className="w-3.5 h-3.5" />
-                  {working ? 'Đang phân tích...' : 'Quét GEE mới nhất'}
+                {working ? 'Đang phân tích...' : 'Quét GEE mới nhất'}
               </button>
             </div>
 
-            {satelliteLoading && (
+            {!activeReservoir && (
+              <div className="py-10 text-center border-2 border-dashed border-slate-200 rounded-xl">
+                <Waves className="w-10 h-10 text-on-surface-variant/20 mx-auto mb-3" />
+                <p className="text-sm font-medium text-on-surface-variant">Chưa chọn hồ chứa</p>
+                <p className="text-[11px] text-on-surface-variant/60 mt-1">Chọn một hồ từ danh sách bên trái để xem dữ liệu vệ tinh</p>
+              </div>
+            )}
+
+            {activeReservoir && satelliteLoading && (
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                 {[1, 2, 3, 4].map((i) => <div key={i} className="h-64 rounded-xl shimmer"></div>)}
               </div>
             )}
-            {!satelliteLoading && (!satelliteHistory || !satelliteHistory.length) && (
+            {activeReservoir && !satelliteLoading && (!satelliteHistory || !satelliteHistory.length) && (
               <div className="py-12 text-center border-2 border-dashed border-slate-200 rounded-xl">
                 <Satellite className="w-12 h-12 text-on-surface-variant/15 mx-auto mb-3" />
                 <p className="text-sm font-medium text-on-surface-variant">Chưa có dữ liệu phân tích vệ tinh</p>
@@ -2061,7 +2197,7 @@ export default function Reservoirs() {
                           }
                         }}
                       >
-                      {!record.raw_response?.scene_id ? (
+                      {(!record.raw_response?.scene_id || (record.raw_response as any)?.source === 'gee' || (record.raw_response as any)?.source === 'simulated_gee' || record.raw_response?.scene_id.includes('COPERNICUS')) ? (
                         <div className="w-full h-full bg-gradient-to-br from-slate-900 via-blue-950 to-slate-900 relative flex flex-col items-center justify-center text-center p-4 select-none">
                           <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.03)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.03)_1px,transparent_1px)] bg-[size:16px_16px] pointer-events-none"></div>
                           <div className="absolute top-0 left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-pulse pointer-events-none" style={{ animationDuration: '3s' }}></div>
@@ -2105,7 +2241,9 @@ export default function Reservoirs() {
                         <span className="text-[10px] font-semibold text-slate-500 uppercase">Mây che phủ</span>
                         <span className="text-xs font-bold text-slate-700">
                           {record.raw_response?.cloud_cover !== undefined
-                            ? `${(record.raw_response.cloud_cover * 100).toFixed(1)}%`
+                            ? `${((record.raw_response as any).source === 'gee' || (record.raw_response as any).source === 'simulated_gee'
+                                ? record.raw_response.cloud_cover
+                                : record.raw_response.cloud_cover * 100).toFixed(1)}%`
                             : 'N/A'}
                         </span>
                       </div>
